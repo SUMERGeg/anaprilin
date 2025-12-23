@@ -20,7 +20,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from storage import ConfirmationStorage, SubscribersStorage
+from storage import ConfirmationStorage, SubscribersStorage, ReminderMessagesStorage, UsedImagesStorage
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -88,10 +88,57 @@ def load_config() -> ReminderConfig:
 CONFIG = load_config()
 STORAGE = ConfirmationStorage(CONFIG.data_file)
 SUBSCRIBERS = SubscribersStorage(CONFIG.data_file.parent / "subscribers.json")
+REMINDER_MESSAGES = ReminderMessagesStorage()
+USED_IMAGES = UsedImagesStorage(CONFIG.data_file.parent / "used_images.json")
+
+# Папка с картинками для напоминаний
+IMAGES_DIR = BASE_DIR / "images"
+IMAGES_DIR.mkdir(exist_ok=True)
+
+# Админы бота (могут использовать тестовые команды)
+ADMIN_USERNAMES = {"stapg"}
 
 
 def make_day_key(chat_id: int, date_key: str) -> str:
     return f"{chat_id}:{date_key}"
+
+
+def is_admin(update: Update) -> bool:
+    """Проверяет, является ли пользователь админом."""
+    user = update.effective_user
+    if user is None:
+        return False
+    # Сравниваем без учёта регистра
+    username = (user.username or "").lower()
+    return username in ADMIN_USERNAMES
+
+
+def get_random_image() -> Path | None:
+    """Возвращает случайную неиспользованную картинку из папки images/ или None."""
+    if not IMAGES_DIR.exists():
+        return None
+    
+    all_images = list(IMAGES_DIR.glob("*.jpg")) + list(IMAGES_DIR.glob("*.jpeg")) + \
+                 list(IMAGES_DIR.glob("*.png")) + list(IMAGES_DIR.glob("*.gif"))
+    
+    if not all_images:
+        return None
+    
+    # Фильтруем уже использованные
+    used = USED_IMAGES.get_used()
+    available = [img for img in all_images if img.name not in used]
+    
+    # Если все использованы — сбрасываем и начинаем заново
+    if not available:
+        logger.info("Все картинки использованы, сбрасываю счётчик")
+        USED_IMAGES.reset()
+        available = all_images
+    
+    # Выбираем случайную и помечаем как использованную
+    chosen = random.choice(available)
+    USED_IMAGES.mark_used(chosen.name)
+    
+    return chosen
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -351,11 +398,37 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     for chat_id in subscribers:
         STORAGE.mark_sent(make_day_key(chat_id, day_key), slot, timestamp)
-        message = await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=build_keyboard(day_key, slot, chat_id),
-        )
+        
+        # Пытаемся отправить с картинкой
+        image_path = get_random_image()
+        if image_path:
+            try:
+                with open(image_path, "rb") as photo:
+                    message = await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=photo,
+                        caption=text,
+                        reply_markup=build_keyboard(day_key, slot, chat_id),
+                    )
+                # Сохраняем file_id картинки для финального сообщения
+                if message.photo:
+                    REMINDER_MESSAGES.set_photo(chat_id, day_key, slot, message.photo[-1].file_id)
+            except Exception as e:
+                logger.warning(f"Не удалось отправить картинку: {e}")
+                message = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=build_keyboard(day_key, slot, chat_id),
+                )
+        else:
+            message = await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=build_keyboard(day_key, slot, chat_id),
+            )
+        
+        # Сохраняем message_id для последующего удаления
+        REMINDER_MESSAGES.add_message(chat_id, day_key, slot, message.message_id)
 
         # Планируем первое напоминание через 10 минут
         context.job_queue.run_once(
@@ -400,11 +473,14 @@ async def send_nag_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     
     text = random.choice(nag_texts)
     
-    await context.bot.send_message(
+    message = await context.bot.send_message(
         chat_id=chat_id,
         text=text,
         reply_markup=build_keyboard(day_key, slot, chat_id),
     )
+    
+    # Сохраняем message_id для последующего удаления
+    REMINDER_MESSAGES.add_message(chat_id, day_key, slot, message.message_id)
 
     # Планируем следующее напоминание через 10 минут, но не более 6 раз (1 час)
     if nag_count < 6:
@@ -434,6 +510,22 @@ def cancel_nag_reminders(context: ContextTypes.DEFAULT_TYPE, chat_id: int, day_k
     for job in jobs_to_remove:
         job.schedule_removal()
         logger.debug(f"Отменена задача напоминания: {job.name}")
+
+
+async def delete_reminder_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int, day_key: str, slot: str, except_message_id: int | None = None) -> str | None:
+    """Удаляет все сообщения напоминаний для данного слота и возвращает file_id картинки."""
+    message_ids, photo_file_id = REMINDER_MESSAGES.clear_messages(chat_id, day_key, slot)
+    
+    for msg_id in message_ids:
+        if msg_id == except_message_id:
+            continue
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            logger.debug(f"Удалено сообщение {msg_id} для {chat_id}")
+        except BadRequest as e:
+            logger.debug(f"Не удалось удалить сообщение {msg_id}: {e}")
+    
+    return photo_file_id
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -478,6 +570,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     chat_day_key = make_day_key(chat_id, day_key)
+    current_message_id = query.message.message_id if query.message else None
+    
     if action == "confirm":
         STORAGE.mark_confirmed(chat_day_key, slot, CONFIG.tz_aware_now.isoformat())
         
@@ -489,19 +583,300 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"✅ Прекрасно, моя хорошая! Таблетка принята! 💊\n\nТы — самая лучшая! 💕",
         ]
         
-        await query.edit_message_text(random.choice(confirm_texts))
+        # Удаляем все другие сообщения напоминаний и получаем file_id картинки
+        photo_file_id = await delete_reminder_messages(context, chat_id, day_key, slot, except_message_id=current_message_id)
+        
+        # Отправляем финальное сообщение с картинкой (если была) и удаляем текущее
+        confirm_text = random.choice(confirm_texts)
+        if photo_file_id:
+            await context.bot.send_photo(chat_id=chat_id, photo=photo_file_id, caption=confirm_text)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=confirm_text)
+        
+        try:
+            await query.message.delete()
+        except BadRequest:
+            pass
+        
         # Отменяем все запланированные напоминания для этого слота
         cancel_nag_reminders(context, chat_id, day_key, slot)
     elif action == "skip":
         STORAGE.mark_skipped(chat_day_key, slot, CONFIG.tz_aware_now.isoformat())
-        await query.edit_message_text(
+        
+        # Удаляем все другие сообщения напоминаний и получаем file_id картинки
+        photo_file_id = await delete_reminder_messages(context, chat_id, day_key, slot, except_message_id=current_message_id)
+        
+        skip_text = (
             f"😔 Лизочка, ты пропустила таблетку...\n\n"
             f"Пожалуйста, постарайся не забывать! Это важно для твоего здоровья. ❤️"
         )
+        
+        # Отправляем финальное сообщение с картинкой (если была) и удаляем текущее
+        if photo_file_id:
+            await context.bot.send_photo(chat_id=chat_id, photo=photo_file_id, caption=skip_text)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=skip_text)
+        try:
+            await query.message.delete()
+        except BadRequest:
+            pass
+        
         # Отменяем все запланированные напоминания для этого слота
         cancel_nag_reminders(context, chat_id, day_key, slot)
     else:
         await query.edit_message_text("Что-то пошло не так... 🤔")
+
+
+# ==================== АДМИНСКИЕ КОМАНДЫ ====================
+
+async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает список админских команд."""
+    if not is_admin(update):
+        await update.message.reply_text("❌ У тебя нет доступа к админским командам.")
+        return
+    
+    await update.message.reply_text(
+        "🔧 Админские команды:\n\n"
+        "/admin — это меню\n"
+        "/atest — тестовое напоминание (с картинкой)\n"
+        "/atest_nag — тестовое повторное напоминание\n"
+        "/astatus — статус бота и подписчиков\n"
+        "/asubs — список подписчиков\n"
+        "/abroadcast [текст] — сообщение всем\n"
+        "/aclear_day — инфо об очистке данных\n"
+        "/aimages — статистика картинок\n"
+        "/aimages_reset — сбросить использованные"
+    )
+
+
+async def admin_test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправляет тестовое напоминание с картинкой (если есть)."""
+    if not is_admin(update):
+        await update.message.reply_text("❌ У тебя нет доступа к админским командам.")
+        return
+    
+    chat = update.effective_chat
+    now = CONFIG.tz_aware_now
+    day_key = now.strftime("%Y-%m-%d")
+    slot = f"ТЕСТ-{now.strftime('%H:%M:%S')}"
+    timestamp = now.isoformat()
+    period = get_period_name(slot)
+    
+    STORAGE.mark_sent(make_day_key(chat.id, day_key), slot, timestamp)
+    
+    text = f"🧪 **Тестовое напоминание (админ)**\n\n💊 Лизочка, выпила таблеточку {period}?"
+    
+    # Пытаемся отправить с картинкой
+    image_path = get_random_image()
+    if image_path:
+        try:
+            with open(image_path, "rb") as photo:
+                message = await context.bot.send_photo(
+                    chat_id=chat.id,
+                    photo=photo,
+                    caption=text,
+                    reply_markup=build_keyboard(day_key, slot, chat.id),
+                    parse_mode="Markdown"
+                )
+                # Сохраняем file_id картинки для финального сообщения
+                if message.photo:
+                    REMINDER_MESSAGES.set_photo(chat.id, day_key, slot, message.photo[-1].file_id)
+                await update.message.reply_text(f"✅ Отправлено с картинкой: {image_path.name}")
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Ошибка с картинкой: {e}\nОтправляю без картинки...")
+            message = await context.bot.send_message(
+                chat_id=chat.id,
+                text=text,
+                reply_markup=build_keyboard(day_key, slot, chat.id),
+                parse_mode="Markdown"
+            )
+    else:
+        message = await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            reply_markup=build_keyboard(day_key, slot, chat.id),
+            parse_mode="Markdown"
+        )
+        await update.message.reply_text("ℹ️ Картинок в папке images/ нет, отправлено без картинки.")
+    
+    REMINDER_MESSAGES.add_message(chat.id, day_key, slot, message.message_id)
+    
+    # Планируем повторное напоминание через 1 минуту (для тестов)
+    context.job_queue.run_once(
+        send_nag_reminder,
+        when=timedelta(minutes=1),
+        name=f"nag-{chat.id}-{day_key}-{slot}-1",
+        data={
+            "day_key": day_key,
+            "slot": slot,
+            "chat_id": chat.id,
+            "nag_count": 1,
+        },
+    )
+
+
+async def admin_test_nag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправляет тестовое повторное напоминание."""
+    if not is_admin(update):
+        await update.message.reply_text("❌ У тебя нет доступа к админским командам.")
+        return
+    
+    chat = update.effective_chat
+    now = CONFIG.tz_aware_now
+    day_key = now.strftime("%Y-%m-%d")
+    slot = f"НАГ-{now.strftime('%H:%M:%S')}"
+    timestamp = now.isoformat()
+    period = get_period_name(slot)
+    
+    STORAGE.mark_sent(make_day_key(chat.id, day_key), slot, timestamp)
+    
+    text = f"🔔 **Тестовое повторное напоминание**\n\n💕 Лизочка, ты ещё не ответила! Выпила таблеточку {period}?"
+    
+    message = await context.bot.send_message(
+        chat_id=chat.id,
+        text=text,
+        reply_markup=build_keyboard(day_key, slot, chat.id),
+        parse_mode="Markdown"
+    )
+    
+    REMINDER_MESSAGES.add_message(chat.id, day_key, slot, message.message_id)
+    await update.message.reply_text("✅ Отправлено повторное напоминание")
+
+
+async def admin_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает статус бота."""
+    if not is_admin(update):
+        await update.message.reply_text("❌ У тебя нет доступа к админским командам.")
+        return
+    
+    subs = SUBSCRIBERS.get_all()
+    images = list(IMAGES_DIR.glob("*.jpg")) + list(IMAGES_DIR.glob("*.jpeg")) + \
+             list(IMAGES_DIR.glob("*.png")) + list(IMAGES_DIR.glob("*.gif"))
+    
+    times_text = ", ".join(t.strftime("%H:%M") for t in CONFIG.reminder_times)
+    
+    await update.message.reply_text(
+        f"📊 **Статус бота:**\n\n"
+        f"👥 Подписчиков: {len(subs)}\n"
+        f"🖼 Картинок: {len(images)}\n"
+        f"⏰ Времена напоминаний: {times_text}\n"
+        f"🌍 Часовой пояс: {CONFIG.timezone}\n"
+        f"📅 Сейчас: {CONFIG.tz_aware_now.strftime('%Y-%m-%d %H:%M:%S')}",
+        parse_mode="Markdown"
+    )
+
+
+async def admin_subscribers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает список подписчиков."""
+    if not is_admin(update):
+        await update.message.reply_text("❌ У тебя нет доступа к админским командам.")
+        return
+    
+    subs = SUBSCRIBERS.get_all()
+    if not subs:
+        await update.message.reply_text("📭 Подписчиков пока нет.")
+        return
+    
+    lines = ["👥 **Подписчики:**\n"]
+    for chat_id in subs:
+        lines.append(f"• `{chat_id}`")
+    
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправляет сообщение всем подписчикам."""
+    if not is_admin(update):
+        await update.message.reply_text("❌ У тебя нет доступа к админским командам.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("❌ Укажи текст: /abroadcast Привет всем!")
+        return
+    
+    text = " ".join(context.args)
+    subs = SUBSCRIBERS.get_all()
+    sent = 0
+    
+    for chat_id in subs:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+            sent += 1
+        except Exception as e:
+            logger.warning(f"Не удалось отправить в {chat_id}: {e}")
+    
+    await update.message.reply_text(f"✅ Отправлено {sent}/{len(subs)} подписчикам")
+
+
+async def admin_clear_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Очищает данные за сегодня (для тестов)."""
+    if not is_admin(update):
+        await update.message.reply_text("❌ У тебя нет доступа к админским командам.")
+        return
+    
+    chat = update.effective_chat
+    today_key = CONFIG.tz_aware_now.strftime("%Y-%m-%d")
+    chat_day_key = make_day_key(chat.id, today_key)
+    
+    # Просто пометим что данных нет (упрощённая очистка)
+    await update.message.reply_text(
+        f"🗑 Для полной очистки удали записи с ключом `{chat_day_key}` из `data/confirmations.json`.\n\n"
+        f"Или используй /atest для создания новых тестовых напоминаний.",
+        parse_mode="Markdown"
+    )
+
+
+async def admin_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает информацию о картинках."""
+    if not is_admin(update):
+        await update.message.reply_text("❌ У тебя нет доступа к админским командам.")
+        return
+    
+    images = list(IMAGES_DIR.glob("*.jpg")) + list(IMAGES_DIR.glob("*.jpeg")) + \
+             list(IMAGES_DIR.glob("*.png")) + list(IMAGES_DIR.glob("*.gif"))
+    
+    used = USED_IMAGES.get_used()
+    available = [img for img in images if img.name not in used]
+    
+    if not images:
+        await update.message.reply_text(
+            f"🖼 **Картинки:**\n\n"
+            f"Папка: `{IMAGES_DIR}`\n"
+            f"Картинок: 0\n\n"
+            f"Добавь картинки (jpg, png, gif) в папку `images/` и они будут отправляться с первым напоминанием.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    lines = [
+        f"🖼 **Картинки:**\n",
+        f"📁 Всего: {len(images)}",
+        f"✅ Доступно: {len(available)}",
+        f"📤 Использовано: {len(used)}\n",
+    ]
+    
+    # Показываем доступные
+    if available:
+        lines.append("**Доступные:**")
+        for img in available[:10]:
+            lines.append(f"• {img.name}")
+        if len(available) > 10:
+            lines.append(f"... и ещё {len(available) - 10}")
+    
+    lines.append("\n`/aimages_reset` — сбросить использованные")
+    
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def admin_images_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сбрасывает список использованных картинок."""
+    if not is_admin(update):
+        await update.message.reply_text("❌ У тебя нет доступа к админским командам.")
+        return
+    
+    count = len(USED_IMAGES.get_used())
+    USED_IMAGES.reset()
+    await update.message.reply_text(f"✅ Сброшено {count} использованных картинок. Теперь все снова доступны!")
 
 
 def build_application() -> Application:
@@ -525,6 +900,18 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("calendar", calendar))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("test", test_reminder))
+    
+    # Админские команды
+    app.add_handler(CommandHandler("admin", admin_help))
+    app.add_handler(CommandHandler("atest", admin_test_reminder))
+    app.add_handler(CommandHandler("atest_nag", admin_test_nag))
+    app.add_handler(CommandHandler("astatus", admin_status))
+    app.add_handler(CommandHandler("asubs", admin_subscribers))
+    app.add_handler(CommandHandler("abroadcast", admin_broadcast))
+    app.add_handler(CommandHandler("aclear_day", admin_clear_day))
+    app.add_handler(CommandHandler("aimages", admin_images))
+    app.add_handler(CommandHandler("aimages_reset", admin_images_reset))
+    
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     for reminder_time in CONFIG.reminder_times:
