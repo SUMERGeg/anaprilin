@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TimedOut, NetworkError
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -19,6 +19,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+from telegram.request import HTTPXRequest
 
 from storage import ConfirmationStorage, SubscribersStorage, ReminderMessagesStorage, UsedImagesStorage
 
@@ -113,6 +114,22 @@ def is_admin(update: Update) -> bool:
     return username in ADMIN_USERNAMES
 
 
+async def safe_send_message(bot, chat_id: int, text: str, **kwargs) -> None:
+    """Отправляет сообщение с автоматическими повторными попытками при ошибках сети."""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        except (TimedOut, NetworkError) as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Таймаут при отправке в {chat_id}, попытка {attempt + 1}/{max_retries}: {e}")
+                import asyncio
+                await asyncio.sleep(1)  # Ждём секунду перед повтором
+            else:
+                logger.error(f"Не удалось отправить сообщение в {chat_id} после {max_retries} попыток: {e}")
+                raise
+
+
 def get_random_image() -> Path | None:
     """Возвращает случайную неиспользованную картинку из папки images/ или None."""
     if not IMAGES_DIR.exists():
@@ -143,25 +160,48 @@ def get_random_image() -> Path | None:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
+    user = update.effective_user
     if chat is None or update.message is None:
         return
+
+    # Логируем входящую команду
+    username = user.username if user else "Unknown"
+    logger.info(f"Получена команда /start от {username} (chat_id={chat.id})")
 
     is_new = not SUBSCRIBERS.contains(chat.id)
     SUBSCRIBERS.add(chat.id)
     times_text = ", ".join(t.strftime("%H:%M") for t in CONFIG.reminder_times)
     header = "💕 Привет, Лизочка!" if is_new else "✨ Настройки обновлены, солнышко!"
-    await update.message.reply_text(
-        f"{header}\n\n"
-        f"Я буду напоминать тебе принять Анаприлин каждый день в {times_text}. "
-        f"Это важно для твоего здоровья, и я буду рядом, чтобы ты не забыла! 💊\n\n"
-        f"Если вдруг забудешь ответить, я мягко напомню ещё раз каждые 10 минут в течение часа. "
-        f"Я забочусь о тебе! 🥰\n\n"
-        "Команды:\n"
-        "/status — посмотреть, как идут дела сегодня\n"
-        "/calendar — календарь с твоей статистикой\n"
-        "/test — проверить, как работают напоминания\n"
-        "/stop — отключить напоминания (но лучше не надо! 😊)",
-    )
+    
+    try:
+        await update.message.reply_text(
+            f"{header}\n\n"
+            f"Я буду напоминать тебе принять Анаприлин каждый день в {times_text}. "
+            f"Это важно для твоего здоровья, и я буду рядом, чтобы ты не забыла! 💊\n\n"
+            f"Если вдруг забудешь ответить, я мягко напомню ещё раз каждые 10 минут в течение часа. "
+            f"Я забочусь о тебе! 🥰\n\n"
+            "Команды:\n"
+            "/status — посмотреть, как идут дела сегодня\n"
+            "/calendar — календарь с твоей статистикой\n"
+            "/test — проверить, как работают напоминания\n"
+            "/stop — отключить напоминания (но лучше не надо! 😊)",
+        )
+        logger.info(f"Ответ на /start отправлен успешно для {username}")
+    except (TimedOut, NetworkError) as e:
+        logger.error(f"Ошибка при отправке ответа на /start для {username}: {e}")
+        # Пробуем ещё раз через секунду
+        import asyncio
+        await asyncio.sleep(1)
+        try:
+            await update.message.reply_text(
+                f"{header}\n\n"
+                f"Я буду напоминать тебе принять Анаприлин каждый день в {times_text}. "
+                f"Это важно для твоего здоровья! 💊\n\n"
+                "Команды: /status, /calendar, /test, /stop"
+            )
+            logger.info(f"Повторная отправка /start успешна для {username}")
+        except Exception as e2:
+            logger.error(f"Повторная ошибка /start для {username}: {e2}")
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -827,10 +867,26 @@ async def admin_images_reset(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 def build_application() -> Application:
+    # Увеличиваем таймауты для стабильности при плохой сети
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        connect_timeout=20.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=10.0,
+    )
+    
     app = (
         ApplicationBuilder()
         .token(CONFIG.token)
         .rate_limiter(AIORateLimiter())
+        .request(request)
+        .get_updates_request(HTTPXRequest(
+            connection_pool_size=8,
+            connect_timeout=20.0,
+            read_timeout=30.0,
+            write_timeout=30.0,
+        ))
         .build()
     )
     if app.job_queue is None:
