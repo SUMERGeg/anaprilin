@@ -9,6 +9,7 @@ from typing import List, Sequence
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
+import asyncio
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, TimedOut, NetworkError
 from telegram.ext import (
@@ -114,6 +115,22 @@ def is_admin(update: Update) -> bool:
     return username in ADMIN_USERNAMES
 
 
+async def send_with_retry(bot, chat_id: int, text: str, max_retries: int = 5, **kwargs):
+    """Отправляет сообщение с повторными попытками при таймаутах."""
+    for attempt in range(max_retries):
+        try:
+            return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        except (TimedOut, NetworkError) as e:
+            wait_time = (attempt + 1) * 2  # 2, 4, 6, 8, 10 секунд
+            logger.warning(f"Таймаут при отправке в {chat_id}, попытка {attempt + 1}/{max_retries}, жду {wait_time}с: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"Не удалось отправить сообщение в {chat_id} после {max_retries} попыток")
+                raise
+    return None
+
+
 def get_random_image() -> Path | None:
     """Возвращает случайную неиспользованную картинку из папки images/ или None."""
     if not IMAGES_DIR.exists():
@@ -157,7 +174,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     times_text = ", ".join(t.strftime("%H:%M") for t in CONFIG.reminder_times)
     header = "💕 Привет, Лизочка!" if is_new else "✨ Настройки обновлены, солнышко!"
     
-    await update.message.reply_text(
+    text = (
         f"{header}\n\n"
         f"Я буду напоминать тебе принять Анаприлин каждый день в {times_text}. "
         f"Это важно для твоего здоровья, и я буду рядом, чтобы ты не забыла! 💊\n\n"
@@ -167,8 +184,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/status — посмотреть, как идут дела сегодня\n"
         "/calendar — календарь с твоей статистикой\n"
         "/test — проверить, как работают напоминания\n"
-        "/stop — отключить напоминания (но лучше не надо! 😊)",
+        "/stop — отключить напоминания (но лучше не надо! 😊)"
     )
+    
+    await send_with_retry(context.bot, chat.id, text)
     logger.info(f"Ответ на /start отправлен для {username}")
 
 
@@ -179,13 +198,15 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if SUBSCRIBERS.contains(chat.id):
         SUBSCRIBERS.remove(chat.id)
-        await update.message.reply_text(
+        await send_with_retry(
+            context.bot, chat.id,
             "😢 Хорошо, Лизочка, я перестану напоминать...\n"
             "Но помни, что таблетки важны для твоего здоровья! ❤️\n\n"
             "Если передумаешь, просто напиши /start — я всегда рядом! 🤗"
         )
     else:
-        await update.message.reply_text(
+        await send_with_retry(
+            context.bot, chat.id,
             "Солнышко, ты ещё не подписана на напоминания! 😊\n"
             "Напиши /start, и я буду заботиться о том, чтобы ты не забывала про таблетки. 💕"
         )
@@ -197,7 +218,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not SUBSCRIBERS.contains(chat.id):
-        await update.message.reply_text(
+        await send_with_retry(
+            context.bot, chat.id,
             "Лизонька, ты ещё не подписана на напоминания! 😊\n"
             "Напиши /start, чтобы я могла заботиться о тебе. 💕"
         )
@@ -206,7 +228,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     today_key = CONFIG.tz_aware_now.strftime("%Y-%m-%d")
     statuses = STORAGE.list_day(make_day_key(chat.id, today_key))
     if not statuses:
-        await update.message.reply_text("Сегодня напоминаний ещё не было, солнышко! ☀️")
+        await send_with_retry(context.bot, chat.id, "Сегодня напоминаний ещё не было, солнышко! ☀️")
         return
 
     lines = ["💊 Как дела с таблеточками сегодня, Лизочка:\n"]
@@ -218,7 +240,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "skipped": "пропущено"
         }.get(item.status, item.status)
         lines.append(f"{emoji} {item.slot} — {status_text}")
-    await update.message.reply_text("\n".join(lines))
+    await send_with_retry(context.bot, chat.id, "\n".join(lines))
 
 
 def build_calendar_text_and_keyboard(chat_id: int, week_offset: int = 0) -> tuple[str, InlineKeyboardMarkup]:
@@ -285,14 +307,15 @@ async def calendar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not SUBSCRIBERS.contains(chat.id):
-        await update.message.reply_text(
+        await send_with_retry(
+            context.bot, chat.id,
             "Лизонька, ты ещё не подписана! 😊\n"
             "Напиши /start, и я буду заботиться о тебе. 💕"
         )
         return
 
     text, keyboard = build_calendar_text_and_keyboard(chat.id, week_offset=0)
-    await update.message.reply_text(text, reply_markup=keyboard)
+    await send_with_retry(context.bot, chat.id, text, reply_markup=keyboard)
 
 
 async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -835,13 +858,13 @@ async def admin_images_reset(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 def build_application() -> Application:
-    # Быстрые таймауты для отправки сообщений (чтобы бот отвечал мгновенно)
+    # Увеличенные таймауты для российского сервера (проблемы с доступом к Telegram API)
     request = HTTPXRequest(
         connection_pool_size=8,
-        connect_timeout=5.0,
-        read_timeout=5.0,
-        write_timeout=5.0,
-        pool_timeout=3.0,
+        connect_timeout=10.0,
+        read_timeout=15.0,
+        write_timeout=15.0,
+        pool_timeout=5.0,
     )
     
     # Для long polling нужен большой таймаут - это нормально
