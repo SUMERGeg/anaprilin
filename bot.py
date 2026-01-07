@@ -399,33 +399,12 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     for chat_id in subscribers:
         STORAGE.mark_sent(make_day_key(chat_id, day_key), slot, timestamp)
         
-        # Пытаемся отправить с картинкой
-        image_path = get_random_image()
-        if image_path:
-            try:
-                with open(image_path, "rb") as photo:
-                    message = await context.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=photo,
-                        caption=text,
-                        reply_markup=build_keyboard(day_key, slot, chat_id),
-                    )
-                # Сохраняем file_id картинки для финального сообщения
-                if message.photo:
-                    REMINDER_MESSAGES.set_photo(chat_id, day_key, slot, message.photo[-1].file_id)
-            except Exception as e:
-                logger.warning(f"Не удалось отправить картинку: {e}")
-                message = await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    reply_markup=build_keyboard(day_key, slot, chat_id),
-                )
-        else:
-            message = await context.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup=build_keyboard(day_key, slot, chat_id),
-            )
+        # Отправляем текстовое напоминание (без картинок для стабильности)
+        message = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=build_keyboard(day_key, slot, chat_id),
+        )
         
         # Сохраняем message_id для последующего удаления
         REMINDER_MESSAGES.add_message(chat_id, day_key, slot, message.message_id)
@@ -577,21 +556,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         # Милые варианты подтверждения
         confirm_texts = [
-            f"✅ Отлично, Лизочка! Молодец, что выпила таблетку! 💕\n\nЯ горжусь тобой! 🥰",
-            f"✅ Супер, солнышко! Таблетка принята! 💊\n\nТы умничка! 💕",
-            f"✅ Ура! Спасибо, что позаботилась о своём здоровье! 💕\n\nЛюблю тебя, Лизочка! 🥰",
-            f"✅ Прекрасно, моя хорошая! Таблетка принята! 💊\n\nТы — самая лучшая! 💕",
+            "✅ Отлично, Лизочка! Молодец, что выпила таблетку! 💕\n\nЯ горжусь тобой! 🥰",
+            "✅ Супер, солнышко! Таблетка принята! 💊\n\nТы умничка! 💕",
+            "✅ Ура! Спасибо, что позаботилась о своём здоровье! 💕\n\nЛюблю тебя, Лизочка! 🥰",
+            "✅ Прекрасно, моя хорошая! Таблетка принята! 💊\n\nТы — самая лучшая! 💕",
         ]
         
-        # Удаляем все другие сообщения напоминаний и получаем file_id картинки
-        photo_file_id = await delete_reminder_messages(context, chat_id, day_key, slot, except_message_id=current_message_id)
+        # Удаляем все другие сообщения напоминаний
+        await delete_reminder_messages(context, chat_id, day_key, slot, except_message_id=current_message_id)
         
-        # Отправляем финальное сообщение с картинкой (если была) и удаляем текущее
+        # Отправляем финальное сообщение и удаляем текущее
         confirm_text = random.choice(confirm_texts)
-        if photo_file_id:
-            await context.bot.send_photo(chat_id=chat_id, photo=photo_file_id, caption=confirm_text)
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=confirm_text)
+        await context.bot.send_message(chat_id=chat_id, text=confirm_text)
         
         try:
             await query.message.delete()
@@ -603,19 +579,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif action == "skip":
         STORAGE.mark_skipped(chat_day_key, slot, CONFIG.tz_aware_now.isoformat())
         
-        # Удаляем все другие сообщения напоминаний и получаем file_id картинки
-        photo_file_id = await delete_reminder_messages(context, chat_id, day_key, slot, except_message_id=current_message_id)
+        # Удаляем все другие сообщения напоминаний
+        await delete_reminder_messages(context, chat_id, day_key, slot, except_message_id=current_message_id)
         
         skip_text = (
-            f"😔 Лизочка, ты пропустила таблетку...\n\n"
-            f"Пожалуйста, постарайся не забывать! Это важно для твоего здоровья. ❤️"
+            "😔 Лизочка, ты пропустила таблетку...\n\n"
+            "Пожалуйста, постарайся не забывать! Это важно для твоего здоровья. ❤️"
         )
         
-        # Отправляем финальное сообщение с картинкой (если была) и удаляем текущее
-        if photo_file_id:
-            await context.bot.send_photo(chat_id=chat_id, photo=photo_file_id, caption=skip_text)
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=skip_text)
+        # Отправляем финальное сообщение и удаляем текущее
+        await context.bot.send_message(chat_id=chat_id, text=skip_text)
         try:
             await query.message.delete()
         except BadRequest:
@@ -650,7 +623,7 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def admin_test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправляет тестовое напоминание с картинкой (если есть)."""
+    """Отправляет тестовое напоминание."""
     if not is_admin(update):
         await update.message.reply_text("❌ У тебя нет доступа к админским командам.")
         return
@@ -664,40 +637,14 @@ async def admin_test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     STORAGE.mark_sent(make_day_key(chat.id, day_key), slot, timestamp)
     
-    text = f"🧪 **Тестовое напоминание (админ)**\n\n💊 Лизочка, выпила таблеточку {period}?"
+    text = f"🧪 Тестовое напоминание (админ)\n\n💊 Лизочка, выпила таблеточку {period}?"
     
-    # Пытаемся отправить с картинкой
-    image_path = get_random_image()
-    if image_path:
-        try:
-            with open(image_path, "rb") as photo:
-                message = await context.bot.send_photo(
-                    chat_id=chat.id,
-                    photo=photo,
-                    caption=text,
-                    reply_markup=build_keyboard(day_key, slot, chat.id),
-                    parse_mode="Markdown"
-                )
-                # Сохраняем file_id картинки для финального сообщения
-                if message.photo:
-                    REMINDER_MESSAGES.set_photo(chat.id, day_key, slot, message.photo[-1].file_id)
-                await update.message.reply_text(f"✅ Отправлено с картинкой: {image_path.name}")
-        except Exception as e:
-            await update.message.reply_text(f"⚠️ Ошибка с картинкой: {e}\nОтправляю без картинки...")
-            message = await context.bot.send_message(
-                chat_id=chat.id,
-                text=text,
-                reply_markup=build_keyboard(day_key, slot, chat.id),
-                parse_mode="Markdown"
-            )
-    else:
-        message = await context.bot.send_message(
-            chat_id=chat.id,
-            text=text,
-            reply_markup=build_keyboard(day_key, slot, chat.id),
-            parse_mode="Markdown"
-        )
-        await update.message.reply_text("ℹ️ Картинок в папке images/ нет, отправлено без картинки.")
+    message = await context.bot.send_message(
+        chat_id=chat.id,
+        text=text,
+        reply_markup=build_keyboard(day_key, slot, chat.id),
+    )
+    await update.message.reply_text("✅ Тестовое напоминание отправлено!")
     
     REMINDER_MESSAGES.add_message(chat.id, day_key, slot, message.message_id)
     
