@@ -22,7 +22,7 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-from storage import ConfirmationStorage, SubscribersStorage, ReminderMessagesStorage, UsedImagesStorage
+from storage import ConfirmationStorage, SubscribersStorage, ReminderMessagesStorage
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -91,7 +91,6 @@ CONFIG = load_config()
 STORAGE = ConfirmationStorage(CONFIG.data_file)
 SUBSCRIBERS = SubscribersStorage(CONFIG.data_file.parent / "subscribers.json")
 REMINDER_MESSAGES = ReminderMessagesStorage()
-USED_IMAGES = UsedImagesStorage(CONFIG.data_file.parent / "used_images.json")
 
 # Папка с картинками для напоминаний
 IMAGES_DIR = BASE_DIR / "images"
@@ -131,8 +130,25 @@ async def send_with_retry(bot, chat_id: int, text: str, max_retries: int = 5, **
     return None
 
 
+async def send_photo_with_retry(bot, chat_id: int, photo_path: Path, caption: str, max_retries: int = 5, **kwargs):
+    """Отправляет фото с подписью с повторными попытками при таймаутах."""
+    for attempt in range(max_retries):
+        try:
+            with open(photo_path, "rb") as photo_file:
+                return await bot.send_photo(chat_id=chat_id, photo=photo_file, caption=caption, **kwargs)
+        except (TimedOut, NetworkError) as e:
+            wait_time = (attempt + 1) * 2
+            logger.warning(f"Таймаут при отправке фото в {chat_id}, попытка {attempt + 1}/{max_retries}, жду {wait_time}с: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"Не удалось отправить фото в {chat_id} после {max_retries} попыток")
+                raise
+    return None
+
+
 def get_random_image() -> Path | None:
-    """Возвращает случайную неиспользованную картинку из папки images/ или None."""
+    """Возвращает случайную картинку из папки images/ или None."""
     if not IMAGES_DIR.exists():
         return None
     
@@ -142,21 +158,7 @@ def get_random_image() -> Path | None:
     if not all_images:
         return None
     
-    # Фильтруем уже использованные
-    used = USED_IMAGES.get_used()
-    available = [img for img in all_images if img.name not in used]
-    
-    # Если все использованы — сбрасываем и начинаем заново
-    if not available:
-        logger.info("Все картинки использованы, сбрасываю счётчик")
-        USED_IMAGES.reset()
-        available = all_images
-    
-    # Выбираем случайную и помечаем как использованную
-    chosen = random.choice(available)
-    USED_IMAGES.mark_used(chosen.name)
-    
-    return chosen
+    return random.choice(all_images)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -430,12 +432,22 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     for chat_id in subscribers:
         STORAGE.mark_sent(make_day_key(chat_id, day_key), slot, timestamp)
         
-        # Отправляем текстовое напоминание с retry (критически важно!)
+        # Отправляем напоминание с картинкой (или без, если картинок нет)
         try:
-            message = await send_with_retry(
-                context.bot, chat_id, text,
-                reply_markup=build_keyboard(day_key, slot, chat_id),
-            )
+            image_path = get_random_image()
+            
+            if image_path:
+                # Отправляем фото с подписью
+                message = await send_photo_with_retry(
+                    context.bot, chat_id, image_path, text,
+                    reply_markup=build_keyboard(day_key, slot, chat_id),
+                )
+            else:
+                # Если картинок нет — отправляем просто текст
+                message = await send_with_retry(
+                    context.bot, chat_id, text,
+                    reply_markup=build_keyboard(day_key, slot, chat_id),
+                )
             
             if message:
                 # Сохраняем message_id для последующего удаления
@@ -659,9 +671,7 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "/astatus — статус бота и подписчиков\n"
         "/asubs — список подписчиков\n"
         "/abroadcast [текст] — сообщение всем\n"
-        "/aclear_day — инфо об очистке данных\n"
-        "/aimages — статистика картинок\n"
-        "/aimages_reset — сбросить использованные"
+        "/aclear_day — инфо об очистке данных"
     )
 
 
@@ -816,59 +826,6 @@ async def admin_clear_day(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
-async def admin_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает информацию о картинках."""
-    if not is_admin(update):
-        await update.message.reply_text("❌ У тебя нет доступа к админским командам.")
-        return
-    
-    images = list(IMAGES_DIR.glob("*.jpg")) + list(IMAGES_DIR.glob("*.jpeg")) + \
-             list(IMAGES_DIR.glob("*.png")) + list(IMAGES_DIR.glob("*.gif"))
-    
-    used = USED_IMAGES.get_used()
-    available = [img for img in images if img.name not in used]
-    
-    if not images:
-        await update.message.reply_text(
-            f"🖼 **Картинки:**\n\n"
-            f"Папка: `{IMAGES_DIR}`\n"
-            f"Картинок: 0\n\n"
-            f"Добавь картинки (jpg, png, gif) в папку `images/` и они будут отправляться с первым напоминанием.",
-            parse_mode="Markdown"
-        )
-        return
-    
-    lines = [
-        f"🖼 **Картинки:**\n",
-        f"📁 Всего: {len(images)}",
-        f"✅ Доступно: {len(available)}",
-        f"📤 Использовано: {len(used)}\n",
-    ]
-    
-    # Показываем доступные
-    if available:
-        lines.append("**Доступные:**")
-        for img in available[:10]:
-            lines.append(f"• {img.name}")
-        if len(available) > 10:
-            lines.append(f"... и ещё {len(available) - 10}")
-    
-    lines.append("\n`/aimages_reset` — сбросить использованные")
-    
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def admin_images_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Сбрасывает список использованных картинок."""
-    if not is_admin(update):
-        await update.message.reply_text("❌ У тебя нет доступа к админским командам.")
-        return
-    
-    count = len(USED_IMAGES.get_used())
-    USED_IMAGES.reset()
-    await update.message.reply_text(f"✅ Сброшено {count} использованных картинок. Теперь все снова доступны!")
-
-
 def build_application() -> Application:
     # Увеличенные таймауты для российского сервера (проблемы с доступом к Telegram API)
     request = HTTPXRequest(
@@ -919,8 +876,6 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("asubs", admin_subscribers))
     app.add_handler(CommandHandler("abroadcast", admin_broadcast))
     app.add_handler(CommandHandler("aclear_day", admin_clear_day))
-    app.add_handler(CommandHandler("aimages", admin_images))
-    app.add_handler(CommandHandler("aimages_reset", admin_images_reset))
     
     app.add_handler(CallbackQueryHandler(handle_callback))
 
