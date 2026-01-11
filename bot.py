@@ -342,10 +342,21 @@ async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     period = get_period_name(slot)
     text = f"🧪 Тестовое напоминание, Лизочка!\n\n💊 Выпила таблеточку {period}?"
 
-    message = await update.message.reply_text(
-        text=text,
-        reply_markup=build_keyboard(day_key, slot, chat.id),
-    )
+    # Отправляем с картинкой если есть
+    image_path = get_random_image()
+    if image_path:
+        message = await send_photo_with_retry(
+            context.bot, chat.id, image_path, text,
+            reply_markup=build_keyboard(day_key, slot, chat.id),
+        )
+    else:
+        message = await update.message.reply_text(
+            text=text,
+            reply_markup=build_keyboard(day_key, slot, chat.id),
+        )
+
+    if message:
+        REMINDER_MESSAGES.add_message(chat.id, day_key, slot, message.message_id)
 
     # Планируем первое напоминание через 10 минут
     context.job_queue.run_once(
@@ -676,7 +687,7 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def admin_test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправляет тестовое напоминание."""
+    """Отправляет тестовое напоминание с картинкой."""
     if not is_admin(update):
         await update.message.reply_text("❌ У тебя нет доступа к админским командам.")
         return
@@ -692,11 +703,19 @@ async def admin_test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     text = f"🧪 Тестовое напоминание (админ)\n\n💊 Лизочка, выпила таблеточку {period}?"
     
-    message = await context.bot.send_message(
-        chat_id=chat.id,
-        text=text,
-        reply_markup=build_keyboard(day_key, slot, chat.id),
-    )
+    # Отправляем с картинкой если есть
+    image_path = get_random_image()
+    if image_path:
+        message = await send_photo_with_retry(
+            context.bot, chat.id, image_path, text,
+            reply_markup=build_keyboard(day_key, slot, chat.id),
+        )
+    else:
+        message = await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            reply_markup=build_keyboard(day_key, slot, chat.id),
+        )
     await update.message.reply_text("✅ Тестовое напоминание отправлено!")
     
     REMINDER_MESSAGES.add_message(chat.id, day_key, slot, message.message_id)
