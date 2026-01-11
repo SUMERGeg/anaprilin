@@ -430,28 +430,34 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     for chat_id in subscribers:
         STORAGE.mark_sent(make_day_key(chat_id, day_key), slot, timestamp)
         
-        # Отправляем текстовое напоминание (без картинок для стабильности)
-        message = await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=build_keyboard(day_key, slot, chat_id),
-        )
-        
-        # Сохраняем message_id для последующего удаления
-        REMINDER_MESSAGES.add_message(chat_id, day_key, slot, message.message_id)
+        # Отправляем текстовое напоминание с retry (критически важно!)
+        try:
+            message = await send_with_retry(
+                context.bot, chat_id, text,
+                reply_markup=build_keyboard(day_key, slot, chat_id),
+            )
+            
+            if message:
+                # Сохраняем message_id для последующего удаления
+                REMINDER_MESSAGES.add_message(chat_id, day_key, slot, message.message_id)
 
-        # Планируем первое напоминание через 10 минут
-        context.job_queue.run_once(
-            send_nag_reminder,
-            when=timedelta(minutes=10),
-            name=f"nag-{chat_id}-{day_key}-{slot}-1",
-            data={
-                "day_key": day_key,
-                "slot": slot,
-                "chat_id": chat_id,
-                "nag_count": 1,
-            },
-        )
+                # Планируем первое напоминание через 10 минут
+                context.job_queue.run_once(
+                    send_nag_reminder,
+                    when=timedelta(minutes=10),
+                    name=f"nag-{chat_id}-{day_key}-{slot}-1",
+                    data={
+                        "day_key": day_key,
+                        "slot": slot,
+                        "chat_id": chat_id,
+                        "nag_count": 1,
+                    },
+                )
+                logger.info(f"Напоминание {slot} успешно отправлено для chat_id={chat_id}")
+            else:
+                logger.error(f"Не удалось отправить напоминание {slot} для chat_id={chat_id}")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке напоминания {slot} для chat_id={chat_id}: {e}")
 
 
 async def send_nag_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -483,14 +489,20 @@ async def send_nag_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     
     text = random.choice(nag_texts)
     
-    message = await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=build_keyboard(day_key, slot, chat_id),
-    )
-    
-    # Сохраняем message_id для последующего удаления
-    REMINDER_MESSAGES.add_message(chat_id, day_key, slot, message.message_id)
+    try:
+        message = await send_with_retry(
+            context.bot, chat_id, text,
+            reply_markup=build_keyboard(day_key, slot, chat_id),
+        )
+        
+        if message:
+            # Сохраняем message_id для последующего удаления
+            REMINDER_MESSAGES.add_message(chat_id, day_key, slot, message.message_id)
+            logger.info(f"Повторное напоминание {slot} #{nag_count} отправлено для chat_id={chat_id}")
+        else:
+            logger.error(f"Не удалось отправить повторное напоминание {slot} для chat_id={chat_id}")
+    except Exception as e:
+        logger.error(f"Ошибка при отправке повторного напоминания {slot} для chat_id={chat_id}: {e}")
 
     # Планируем следующее напоминание через 10 минут, но не более 6 раз (1 час)
     if nag_count < 6:
