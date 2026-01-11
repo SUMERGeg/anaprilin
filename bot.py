@@ -1,4 +1,5 @@
 from __future__ import annotations
+import io
 import logging
 import os
 import random
@@ -10,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 import asyncio
+from PIL import Image
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, TimedOut, NetworkError
 from telegram.ext import (
@@ -130,12 +132,43 @@ async def send_with_retry(bot, chat_id: int, text: str, max_retries: int = 5, **
     return None
 
 
+def compress_image(photo_path: Path, max_size: int = 1280, quality: int = 85) -> io.BytesIO:
+    """Сжимает изображение до указанного размера и качества, возвращает байты."""
+    with Image.open(photo_path) as img:
+        # Конвертируем в RGB если нужно (для PNG с альфа-каналом)
+        if img.mode in ('RGBA', 'P'):
+            img = img.convert('RGB')
+        
+        # Уменьшаем размер если больше max_size
+        if max(img.size) > max_size:
+            ratio = max_size / max(img.size)
+            new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+        
+        # Сохраняем в буфер как JPEG
+        buffer = io.BytesIO()
+        img.save(buffer, format='JPEG', quality=quality, optimize=True)
+        buffer.seek(0)
+        return buffer
+
+
 async def send_photo_with_retry(bot, chat_id: int, photo_path: Path, caption: str, max_retries: int = 5, **kwargs):
-    """Отправляет фото с подписью с повторными попытками при таймаутах."""
+    """Отправляет сжатое фото с подписью с повторными попытками при таймаутах."""
+    # Сжимаем картинку один раз перед отправкой
+    try:
+        compressed = compress_image(photo_path)
+    except Exception as e:
+        logger.warning(f"Не удалось сжать изображение {photo_path}: {e}, отправляю оригинал")
+        compressed = None
+    
     for attempt in range(max_retries):
         try:
-            with open(photo_path, "rb") as photo_file:
-                return await bot.send_photo(chat_id=chat_id, photo=photo_file, caption=caption, **kwargs)
+            if compressed:
+                compressed.seek(0)  # Сбрасываем позицию для повторной отправки
+                return await bot.send_photo(chat_id=chat_id, photo=compressed, caption=caption, **kwargs)
+            else:
+                with open(photo_path, "rb") as photo_file:
+                    return await bot.send_photo(chat_id=chat_id, photo=photo_file, caption=caption, **kwargs)
         except (TimedOut, NetworkError) as e:
             wait_time = (attempt + 1) * 2
             logger.warning(f"Таймаут при отправке фото в {chat_id}, попытка {attempt + 1}/{max_retries}, жду {wait_time}с: {e}")
@@ -628,24 +661,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "✅ Прекрасно, моя хорошая! Таблетка принята! 💊\n\nТы — самая лучшая! 💕",
         ]
         
-        # Удаляем все другие сообщения напоминаний
+        # Удаляем все повторные напоминания (nag), кроме текущего сообщения
         await delete_reminder_messages(context, chat_id, day_key, slot, except_message_id=current_message_id)
         
-        # Отправляем финальное сообщение и удаляем текущее
         confirm_text = random.choice(confirm_texts)
-        await context.bot.send_message(chat_id=chat_id, text=confirm_text)
         
+        # Редактируем текущее сообщение (сохраняем картинку, меняем подпись)
         try:
-            await query.message.delete()
-        except BadRequest:
-            pass
+            if query.message.photo:
+                # Если это сообщение с фото — редактируем подпись
+                await query.edit_message_caption(caption=confirm_text, reply_markup=None)
+            else:
+                # Если это текстовое сообщение — редактируем текст
+                await query.edit_message_text(text=confirm_text, reply_markup=None)
+        except BadRequest as e:
+            logger.debug(f"Не удалось отредактировать сообщение: {e}")
+            # Fallback: отправляем новое сообщение
+            await context.bot.send_message(chat_id=chat_id, text=confirm_text)
         
         # Отменяем все запланированные напоминания для этого слота
         cancel_nag_reminders(context, chat_id, day_key, slot)
     elif action == "skip":
         STORAGE.mark_skipped(chat_day_key, slot, CONFIG.tz_aware_now.isoformat())
         
-        # Удаляем все другие сообщения напоминаний
+        # Удаляем все повторные напоминания (nag), кроме текущего сообщения
         await delete_reminder_messages(context, chat_id, day_key, slot, except_message_id=current_message_id)
         
         skip_text = (
@@ -653,12 +692,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Пожалуйста, постарайся не забывать! Это важно для твоего здоровья. ❤️"
         )
         
-        # Отправляем финальное сообщение и удаляем текущее
-        await context.bot.send_message(chat_id=chat_id, text=skip_text)
+        # Редактируем текущее сообщение (сохраняем картинку, меняем подпись)
         try:
-            await query.message.delete()
-        except BadRequest:
-            pass
+            if query.message.photo:
+                # Если это сообщение с фото — редактируем подпись
+                await query.edit_message_caption(caption=skip_text, reply_markup=None)
+            else:
+                # Если это текстовое сообщение — редактируем текст
+                await query.edit_message_text(text=skip_text, reply_markup=None)
+        except BadRequest as e:
+            logger.debug(f"Не удалось отредактировать сообщение: {e}")
+            # Fallback: отправляем новое сообщение
+            await context.bot.send_message(chat_id=chat_id, text=skip_text)
         
         # Отменяем все запланированные напоминания для этого слота
         cancel_nag_reminders(context, chat_id, day_key, slot)
