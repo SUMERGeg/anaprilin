@@ -1,5 +1,4 @@
-python-telegram-bot[rate-limiter,job-queue]==20.8
-socksio==1.0.0
+python-telegram-bot[socks,rate-limiter,job-queue]==20.8
 python-dotenv==1.0.1
 tzdata==2024.2
 urllib3<2.0
