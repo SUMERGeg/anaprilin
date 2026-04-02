@@ -892,21 +892,31 @@ async def admin_clear_day(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 def build_application() -> Application:
     # Увеличенные таймауты для российского сервера (проблемы с доступом к Telegram API)
+    proxy_url = (os.environ.get("TELEGRAM_PROXY") or "").strip() or None
+    if proxy_url:
+        logger.info("Telegram API через прокси (TELEGRAM_PROXY задан).")
+        # Через SOCKS TLS к api.telegram.org часто дольше; 5 с даёт ложные ConnectTimeout
+        req_connect, gu_connect = 25.0, 25.0
+    else:
+        req_connect, gu_connect = 10.0, 5.0
+
     request = HTTPXRequest(
         connection_pool_size=8,
-        connect_timeout=10.0,
+        connect_timeout=req_connect,
         read_timeout=15.0,
         write_timeout=15.0,
         pool_timeout=5.0,
+        proxy_url=proxy_url,
     )
-    
+
     # Для long polling нужен большой таймаут - это нормально
     get_updates_request = HTTPXRequest(
         connection_pool_size=8,
-        connect_timeout=5.0,
+        connect_timeout=gu_connect,
         read_timeout=60.0,  # Long polling ждёт до 60 сек - это ок
         write_timeout=5.0,
         pool_timeout=3.0,
+        proxy_url=proxy_url,
     )
     
     app = (
