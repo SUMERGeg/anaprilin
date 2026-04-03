@@ -176,6 +176,24 @@ class ReminderMessagesStorage:
             photo = self._photos.pop(key, None)
             return messages, photo
 
+    def remove_messages(self, chat_id: int, day_key: str, slot: str, message_ids: List[int]) -> Optional[str]:
+        """Удаляет только указанные message_id, сохраняя остальные."""
+        with self._lock:
+            key = self._make_key(chat_id, day_key, slot)
+            existing = self._messages.get(key, [])
+            if not existing:
+                return self._photos.get(key)
+
+            to_remove = set(message_ids)
+            remaining = [msg_id for msg_id in existing if msg_id not in to_remove]
+
+            if remaining:
+                self._messages[key] = remaining
+                return self._photos.get(key)
+
+            self._messages.pop(key, None)
+            return self._photos.pop(key, None)
+
 
 class SubscribersStorage:
     """Хранилище подписчиков бота."""

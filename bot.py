@@ -592,20 +592,35 @@ def cancel_nag_reminders(context: ContextTypes.DEFAULT_TYPE, chat_id: int, day_k
         logger.debug(f"Отменена задача напоминания: {job.name}")
 
 
-async def delete_reminder_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int, day_key: str, slot: str, except_message_id: int | None = None) -> str | None:
-    """Удаляет все сообщения напоминаний для данного слота и возвращает file_id картинки."""
-    message_ids, photo_file_id = REMINDER_MESSAGES.clear_messages(chat_id, day_key, slot)
-    
-    for msg_id in message_ids:
-        if msg_id == except_message_id:
-            continue
+async def delete_reminder_messages(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    day_key: str,
+    slot: str,
+    except_message_id: int | None = None,
+    keep_root_message: bool = False,
+) -> str | None:
+    """Удаляет дубликаты напоминаний и возвращает file_id картинки (если есть)."""
+    message_ids = REMINDER_MESSAGES.get_messages(chat_id, day_key, slot)
+    keep_ids = set()
+
+    if except_message_id is not None:
+        keep_ids.add(except_message_id)
+
+    # Первый message_id — исходное (корневое) напоминание; его можно сохранить
+    if keep_root_message and message_ids:
+        keep_ids.add(message_ids[0])
+
+    message_ids_to_delete = [msg_id for msg_id in message_ids if msg_id not in keep_ids]
+
+    for msg_id in message_ids_to_delete:
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
             logger.debug(f"Удалено сообщение {msg_id} для {chat_id}")
         except BadRequest as e:
             logger.debug(f"Не удалось удалить сообщение {msg_id}: {e}")
-    
-    return photo_file_id
+
+    return REMINDER_MESSAGES.remove_messages(chat_id, day_key, slot, message_ids_to_delete)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -663,8 +678,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "✅ Прекрасно, моя хорошая! Таблетка принята! 💊\n\nТы — самая лучшая! 💕",
         ]
         
-        # Удаляем все повторные напоминания (nag), кроме текущего сообщения
-        await delete_reminder_messages(context, chat_id, day_key, slot, except_message_id=current_message_id)
+        # Удаляем все повторные напоминания (nag), но сохраняем корневое сообщение с фото
+        await delete_reminder_messages(
+            context,
+            chat_id,
+            day_key,
+            slot,
+            except_message_id=current_message_id,
+            keep_root_message=True,
+        )
         
         confirm_text = random.choice(confirm_texts)
         
@@ -686,8 +708,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif action == "skip":
         STORAGE.mark_skipped(chat_day_key, slot, CONFIG.tz_aware_now.isoformat())
         
-        # Удаляем все повторные напоминания (nag), кроме текущего сообщения
-        await delete_reminder_messages(context, chat_id, day_key, slot, except_message_id=current_message_id)
+        # Удаляем все повторные напоминания (nag), но сохраняем корневое сообщение с фото
+        await delete_reminder_messages(
+            context,
+            chat_id,
+            day_key,
+            slot,
+            except_message_id=current_message_id,
+            keep_root_message=True,
+        )
         
         skip_text = (
             "😔 Лизочка, ты пропустила таблетку...\n\n"
