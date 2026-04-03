@@ -24,7 +24,7 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-from storage import ConfirmationStorage, SubscribersStorage, ReminderMessagesStorage
+from storage import ConfirmationStorage, SubscribersStorage, ReminderMessagesStorage, UserSettingsStorage
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -95,6 +95,8 @@ CONFIG = load_config()
 STORAGE = ConfirmationStorage(CONFIG.data_file)
 SUBSCRIBERS = SubscribersStorage(CONFIG.data_file.parent / "subscribers.json")
 REMINDER_MESSAGES = ReminderMessagesStorage()
+USER_SETTINGS = UserSettingsStorage(CONFIG.data_file.parent / "user_settings.json")
+ESCALATION_TARGET = os.environ.get("ESCALATION_TARGET", "@stapg")
 
 # Папка с картинками для напоминаний
 IMAGES_DIR = BASE_DIR / "images"
@@ -106,6 +108,14 @@ ADMIN_USERNAMES = {"stapg"}
 
 def make_day_key(chat_id: int, date_key: str) -> str:
     return f"{chat_id}:{date_key}"
+
+
+def get_default_slots() -> List[str]:
+    return [t.strftime("%H:%M") for t in CONFIG.reminder_times]
+
+
+def get_user_slots(chat_id: int) -> List[str]:
+    return USER_SETTINGS.get_times(chat_id) or get_default_slots()
 
 
 def is_admin(update: Update) -> bool:
@@ -208,7 +218,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     is_new = not SUBSCRIBERS.contains(chat.id)
     SUBSCRIBERS.add(chat.id)
-    times_text = ", ".join(t.strftime("%H:%M") for t in CONFIG.reminder_times)
+    times_text = ", ".join(get_user_slots(chat.id))
     header = "💕 Привет, Лизочка!" if is_new else "✨ Настройки обновлены, солнышко!"
     
     text = (
@@ -217,15 +227,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Это важно для твоего здоровья, и я буду рядом, чтобы ты не забыла! 💊\n\n"
         f"Если вдруг забудешь ответить, я мягко напомню ещё раз каждые 10 минут в течение часа. "
         f"Я забочусь о тебе! 🥰\n\n"
-        "Команды:\n"
-        "/status — посмотреть, как идут дела сегодня\n"
-        "/calendar — календарь с твоей статистикой\n"
-        "/test — проверить, как работают напоминания\n"
-        "/stop — отключить напоминания (но лучше не надо! 😊)"
+        "Используй кнопки ниже — так удобнее 💕"
     )
-    
-    await send_with_retry(context.bot, chat.id, text)
+
+    await send_with_retry(context.bot, chat.id, text, reply_markup=build_start_menu_keyboard())
     logger.info(f"Ответ на /start отправлен для {username}")
+
+
+def build_start_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📊 Статус", callback_data="menu_status"),
+                InlineKeyboardButton("📅 Календарь", callback_data="menu_calendar"),
+            ],
+            [
+                InlineKeyboardButton("🧪 Тест", callback_data="menu_test"),
+                InlineKeyboardButton("⏰ Расписание", callback_data="menu_reschedule_help"),
+            ],
+            [
+                InlineKeyboardButton("🛑 Стоп", callback_data="menu_stop"),
+            ],
+        ]
+    )
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -253,19 +277,21 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if chat is None or update.message is None:
         return
+    await send_status(context, chat.id)
 
-    if not SUBSCRIBERS.contains(chat.id):
+async def send_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    if not SUBSCRIBERS.contains(chat_id):
         await send_with_retry(
-            context.bot, chat.id,
+            context.bot, chat_id,
             "Лизонька, ты ещё не подписана на напоминания! 😊\n"
             "Напиши /start, чтобы я могла заботиться о тебе. 💕"
         )
         return
 
     today_key = CONFIG.tz_aware_now.strftime("%Y-%m-%d")
-    statuses = STORAGE.list_day(make_day_key(chat.id, today_key))
+    statuses = STORAGE.list_day(make_day_key(chat_id, today_key))
     if not statuses:
-        await send_with_retry(context.bot, chat.id, "Сегодня напоминаний ещё не было, солнышко! ☀️")
+        await send_with_retry(context.bot, chat_id, "Сегодня напоминаний ещё не было, солнышко! ☀️")
         return
 
     lines = ["💊 Как дела с таблеточками сегодня, Лизочка:\n"]
@@ -277,7 +303,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "skipped": "пропущено"
         }.get(item.status, item.status)
         lines.append(f"{emoji} {item.slot} — {status_text}")
-    await send_with_retry(context.bot, chat.id, "\n".join(lines))
+    await send_with_retry(context.bot, chat_id, "\n".join(lines))
 
 
 def build_calendar_text_and_keyboard(chat_id: int, week_offset: int = 0) -> tuple[str, InlineKeyboardMarkup]:
@@ -342,26 +368,30 @@ async def calendar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if chat is None or update.message is None:
         return
+    await send_calendar(context, chat.id)
 
-    if not SUBSCRIBERS.contains(chat.id):
+async def send_calendar(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    if not SUBSCRIBERS.contains(chat_id):
         await send_with_retry(
-            context.bot, chat.id,
+            context.bot, chat_id,
             "Лизонька, ты ещё не подписана! 😊\n"
             "Напиши /start, и я буду заботиться о тебе. 💕"
         )
         return
-
-    text, keyboard = build_calendar_text_and_keyboard(chat.id, week_offset=0)
-    await send_with_retry(context.bot, chat.id, text, reply_markup=keyboard)
+    text, keyboard = build_calendar_text_and_keyboard(chat_id, week_offset=0)
+    await send_with_retry(context.bot, chat_id, text, reply_markup=keyboard)
 
 
 async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if chat is None or update.message is None:
         return
+    await send_test_reminder(context, chat.id, is_admin_test=False)
 
-    if not SUBSCRIBERS.contains(chat.id):
-        await update.message.reply_text(
+async def send_test_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, is_admin_test: bool) -> None:
+    if not SUBSCRIBERS.contains(chat_id):
+        await send_with_retry(
+            context.bot, chat_id,
             "Солнышко, сначала подпишись! 🥰\n"
             "Напиши /start, пожалуйста. 💕"
         )
@@ -371,40 +401,64 @@ async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     day_key = now.strftime("%Y-%m-%d")
     slot = f"ТЕСТ-{now.strftime('%H:%M')}"
     timestamp = now.isoformat()
+    STORAGE.mark_sent(make_day_key(chat_id, day_key), slot, timestamp)
 
-    STORAGE.mark_sent(make_day_key(chat.id, day_key), slot, timestamp)
-    
     period = get_period_name(slot)
-    text = f"🧪 Тестовое напоминание, Лизочка!\n\n💊 Выпила таблеточку {period}?"
+    text = (
+        f"🧪 Тестовое напоминание (админ)\n\n💊 Лизочка, выпила таблеточку {period}?"
+        if is_admin_test
+        else f"🧪 Тестовое напоминание, Лизочка!\n\n💊 Выпила таблеточку {period}?"
+    )
 
-    # Отправляем с картинкой если есть
     image_path = get_random_image()
     if image_path:
         message = await send_photo_with_retry(
-            context.bot, chat.id, image_path, text,
-            reply_markup=build_keyboard(day_key, slot, chat.id),
+            context.bot, chat_id, image_path, text,
+            reply_markup=build_keyboard(day_key, slot, chat_id),
         )
     else:
-        message = await update.message.reply_text(
-            text=text,
-            reply_markup=build_keyboard(day_key, slot, chat.id),
+        message = await send_with_retry(
+            context.bot, chat_id, text,
+            reply_markup=build_keyboard(day_key, slot, chat_id),
         )
 
     if message:
-        REMINDER_MESSAGES.add_message(chat.id, day_key, slot, message.message_id)
+        REMINDER_MESSAGES.add_message(chat_id, day_key, slot, message.message_id)
+    schedule_nag_and_escalation(context, chat_id, day_key, slot)
 
-    # Планируем первое напоминание через 10 минут
-    context.job_queue.run_once(
-        send_nag_reminder,
-        when=timedelta(minutes=10),
-        name=f"nag-{chat.id}-{day_key}-{slot}-1",
-        data={
-            "day_key": day_key,
-            "slot": slot,
-            "chat_id": chat.id,
-            "nag_count": 1,
-        },
-    )
+
+async def reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat is None or update.message is None:
+        return
+
+    if not SUBSCRIBERS.contains(chat.id):
+        await send_with_retry(context.bot, chat.id, "Сначала нажми /start, чтобы включить напоминания.")
+        return
+
+    if not context.args:
+        current = ", ".join(get_user_slots(chat.id))
+        await send_with_retry(
+            context.bot,
+            chat.id,
+            "⏰ Текущее расписание: "
+            f"{current}\n\n"
+            "Чтобы изменить, отправь:\n"
+            "`/reschedule 09:00,15:00,21:00`",
+            parse_mode="Markdown",
+        )
+        return
+
+    raw = " ".join(context.args).replace(" ", "")
+    try:
+        new_times = sorted(parse_times(raw))
+    except ValueError as exc:
+        await send_with_retry(context.bot, chat.id, f"⚠️ {exc}")
+        return
+
+    slots = [t.strftime("%H:%M") for t in new_times]
+    USER_SETTINGS.set_times(chat.id, slots)
+    await send_with_retry(context.bot, chat.id, "✅ Новое расписание сохранено: " + ", ".join(slots))
 
 
 def get_period_name(slot_time: str) -> str:
@@ -441,81 +495,102 @@ def build_keyboard(day_key: str, slot: str, chat_id: int) -> InlineKeyboardMarku
     )
 
 
-async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
-    slot: str = context.job.data["slot"]
+def schedule_nag_and_escalation(context: ContextTypes.DEFAULT_TYPE, chat_id: int, day_key: str, slot: str) -> None:
+    if context.job_queue is None:
+        return
+    context.job_queue.run_once(
+        send_nag_reminder,
+        when=timedelta(minutes=10),
+        name=f"nag-{chat_id}-{day_key}-{slot}-1",
+        data={
+            "day_key": day_key,
+            "slot": slot,
+            "chat_id": chat_id,
+            "nag_count": 1,
+        },
+    )
+    context.job_queue.run_once(
+        send_escalation_reminder,
+        when=timedelta(minutes=30),
+        name=f"esc-{chat_id}-{day_key}-{slot}",
+        data={
+            "day_key": day_key,
+            "slot": slot,
+            "chat_id": chat_id,
+        },
+    )
+
+
+async def dispatch_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = CONFIG.tz_aware_now
+    current_slot = now.strftime("%H:%M")
     day_key = now.strftime("%Y-%m-%d")
     timestamp = now.isoformat()
 
-    subscribers = SUBSCRIBERS.get_all()
-    if not subscribers:
-        logger.debug("Нет активных подписчиков — пропускаю напоминание %s.", slot)
-        return
+    for chat_id in SUBSCRIBERS.get_all():
+        slots = get_user_slots(chat_id)
+        if current_slot not in slots:
+            continue
 
+        existing = STORAGE.list_day(make_day_key(chat_id, day_key))
+        if any(item.slot == current_slot for item in existing):
+            continue
+
+        await send_reminder_to_chat(context, chat_id, current_slot, day_key, timestamp)
+
+
+async def send_reminder_to_chat(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    slot: str,
+    day_key: str,
+    timestamp: str,
+) -> None:
+    STORAGE.mark_sent(make_day_key(chat_id, day_key), slot, timestamp)
     period = get_period_name(slot)
-    
-    # Милые вариации напоминаний в зависимости от времени суток
     morning_texts = [
-        f"💕 Доброе утро, Лизочка!\n\nНе забудь принять таблеточку Анаприлина, солнышко. Это важно для твоего здоровья! 💊",
-        f"☀️ Привет, моя хорошая!\n\nВремя выпить утреннюю таблетку Анаприлина. Я забочусь о тебе! 💊💕",
+        "💕 Доброе утро, Лизочка!\n\nНе забудь принять таблеточку Анаприлина, солнышко. Это важно для твоего здоровья! 💊",
+        "☀️ Привет, моя хорошая!\n\nВремя выпить утреннюю таблетку Анаприлина. Я забочусь о тебе! 💊💕",
     ]
     afternoon_texts = [
-        f"🌸 Лизонька, привет!\n\nПора принять дневную таблетку Анаприлина. Не забудь, пожалуйста! 💊",
-        f"💐 Как дела, солнышко?\n\nНапоминаю про дневную таблеточку Анаприлина. Береги себя! 💊💕",
+        "🌸 Лизонька, привет!\n\nПора принять дневную таблетку Анаприлина. Не забудь, пожалуйста! 💊",
+        "💐 Как дела, солнышко?\n\nНапоминаю про дневную таблеточку Анаприлина. Береги себя! 💊💕",
     ]
     evening_texts = [
-        f"🌙 Добрый вечер, Лизочка!\n\nПора принять вечернюю таблетку Анаприлина. Я рядом! 💊",
-        f"✨ Милая, не забудь вечернюю таблеточку Анаприлина. Это важно! 💊💕",
+        "🌙 Добрый вечер, Лизочка!\n\nПора принять вечернюю таблетку Анаприлина. Я рядом! 💊",
+        "✨ Милая, не забудь вечернюю таблеточку Анаприлина. Это важно! 💊💕",
     ]
-    
-    if period == "утром":
-        text = random.choice(morning_texts)
-    elif period == "днем":
-        text = random.choice(afternoon_texts)
-    else:
-        text = random.choice(evening_texts)
+    text = random.choice(morning_texts if period == "утром" else afternoon_texts if period == "днем" else evening_texts)
 
-    for chat_id in subscribers:
-        STORAGE.mark_sent(make_day_key(chat_id, day_key), slot, timestamp)
-        
-        # Отправляем напоминание с картинкой (или без, если картинок нет)
-        try:
-            image_path = get_random_image()
-            
-            if image_path:
-                # Отправляем фото с подписью
-                message = await send_photo_with_retry(
-                    context.bot, chat_id, image_path, text,
-                    reply_markup=build_keyboard(day_key, slot, chat_id),
-                )
-            else:
-                # Если картинок нет — отправляем просто текст
-                message = await send_with_retry(
-                    context.bot, chat_id, text,
-                    reply_markup=build_keyboard(day_key, slot, chat_id),
-                )
-            
-            if message:
-                # Сохраняем message_id для последующего удаления
-                REMINDER_MESSAGES.add_message(chat_id, day_key, slot, message.message_id)
+    try:
+        image_path = get_random_image()
+        if image_path:
+            message = await send_photo_with_retry(
+                context.bot, chat_id, image_path, text,
+                reply_markup=build_keyboard(day_key, slot, chat_id),
+            )
+        else:
+            message = await send_with_retry(
+                context.bot, chat_id, text,
+                reply_markup=build_keyboard(day_key, slot, chat_id),
+            )
+        if message:
+            REMINDER_MESSAGES.add_message(chat_id, day_key, slot, message.message_id)
+            schedule_nag_and_escalation(context, chat_id, day_key, slot)
+            logger.info(f"Напоминание {slot} успешно отправлено для chat_id={chat_id}")
+    except Exception as e:
+        logger.error(f"Ошибка при отправке напоминания {slot} для chat_id={chat_id}: {e}")
 
-                # Планируем первое напоминание через 10 минут
-                context.job_queue.run_once(
-                    send_nag_reminder,
-                    when=timedelta(minutes=10),
-                    name=f"nag-{chat_id}-{day_key}-{slot}-1",
-                    data={
-                        "day_key": day_key,
-                        "slot": slot,
-                        "chat_id": chat_id,
-                        "nag_count": 1,
-                    },
-                )
-                logger.info(f"Напоминание {slot} успешно отправлено для chat_id={chat_id}")
-            else:
-                logger.error(f"Не удалось отправить напоминание {slot} для chat_id={chat_id}")
-        except Exception as e:
-            logger.error(f"Ошибка при отправке напоминания {slot} для chat_id={chat_id}: {e}")
+
+async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Deprecated path (оставлено для совместимости старых job-данных)
+    data = context.job.data if context.job else {}
+    slot = data.get("slot")
+    chat_id = data.get("chat_id")
+    if slot is None or chat_id is None:
+        return
+    now = CONFIG.tz_aware_now
+    await send_reminder_to_chat(context, chat_id, slot, now.strftime("%Y-%m-%d"), now.isoformat())
 
 
 async def send_nag_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -592,6 +667,34 @@ def cancel_nag_reminders(context: ContextTypes.DEFAULT_TYPE, chat_id: int, day_k
         logger.debug(f"Отменена задача напоминания: {job.name}")
 
 
+def cancel_escalation_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, day_key: str, slot: str) -> None:
+    job_queue = context.job_queue
+    if job_queue is None:
+        return
+    job_name = f"esc-{chat_id}-{day_key}-{slot}"
+    for job in [job for job in job_queue.jobs() if job.name == job_name]:
+        job.schedule_removal()
+
+
+async def send_escalation_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.job.data
+    day_key = data["day_key"]
+    slot = data["slot"]
+    chat_id = data["chat_id"]
+
+    statuses = STORAGE.list_day(make_day_key(chat_id, day_key))
+    slot_status = next((item for item in statuses if item.slot == slot), None)
+    if not slot_status or slot_status.status != "pending":
+        return
+
+    alert_text = "Лиза не подтвердила таблетку, напомни ей!"
+    try:
+        await context.bot.send_message(chat_id=ESCALATION_TARGET, text=alert_text)
+        logger.info("Эскалация отправлена для chat_id=%s slot=%s -> %s", chat_id, slot, ESCALATION_TARGET)
+    except Exception as e:
+        logger.warning("Не удалось отправить эскалацию: %s", e)
+
+
 async def delete_reminder_messages(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -629,6 +732,42 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("Ошибка обработки запроса.")
         return
     
+    # Кнопки быстрого меню из /start
+    if query.data.startswith("menu_"):
+        chat_id = query.message.chat_id if query.message else None
+        if chat_id is None:
+            await query.answer("Ошибка получения чата.")
+            return
+        await query.answer()
+        if query.data == "menu_status":
+            await send_status(context, chat_id)
+        elif query.data == "menu_calendar":
+            await send_calendar(context, chat_id)
+        elif query.data == "menu_test":
+            await send_test_reminder(context, chat_id, is_admin_test=False)
+        elif query.data == "menu_stop":
+            if SUBSCRIBERS.contains(chat_id):
+                SUBSCRIBERS.remove(chat_id)
+                await send_with_retry(
+                    context.bot, chat_id,
+                    "😢 Хорошо, Лизочка, я перестану напоминать...\n"
+                    "Если передумаешь, нажми /start 💕"
+                )
+            else:
+                await send_with_retry(context.bot, chat_id, "Ты уже не подписана на напоминания.")
+        elif query.data == "menu_reschedule_help":
+            current = ", ".join(get_user_slots(chat_id))
+            await send_with_retry(
+                context.bot,
+                chat_id,
+                "⏰ Текущее расписание: "
+                f"{current}\n\n"
+                "Измени его командой:\n"
+                "`/reschedule 09:00,15:00,21:00`",
+                parse_mode="Markdown",
+            )
+        return
+
     # Обработка календаря
     if query.data.startswith("cal_week|"):
         try:
@@ -705,6 +844,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         # Отменяем все запланированные напоминания для этого слота
         cancel_nag_reminders(context, chat_id, day_key, slot)
+        cancel_escalation_reminder(context, chat_id, day_key, slot)
     elif action == "skip":
         STORAGE.mark_skipped(chat_day_key, slot, CONFIG.tz_aware_now.isoformat())
         
@@ -738,6 +878,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         # Отменяем все запланированные напоминания для этого слота
         cancel_nag_reminders(context, chat_id, day_key, slot)
+        cancel_escalation_reminder(context, chat_id, day_key, slot)
     else:
         await query.edit_message_text("Что-то пошло не так... 🤔")
 
@@ -769,45 +910,8 @@ async def admin_test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     chat = update.effective_chat
-    now = CONFIG.tz_aware_now
-    day_key = now.strftime("%Y-%m-%d")
-    slot = f"ТЕСТ-{now.strftime('%H:%M:%S')}"
-    timestamp = now.isoformat()
-    period = get_period_name(slot)
-    
-    STORAGE.mark_sent(make_day_key(chat.id, day_key), slot, timestamp)
-    
-    text = f"🧪 Тестовое напоминание (админ)\n\n💊 Лизочка, выпила таблеточку {period}?"
-    
-    # Отправляем с картинкой если есть
-    image_path = get_random_image()
-    if image_path:
-        message = await send_photo_with_retry(
-            context.bot, chat.id, image_path, text,
-            reply_markup=build_keyboard(day_key, slot, chat.id),
-        )
-    else:
-        message = await context.bot.send_message(
-            chat_id=chat.id,
-            text=text,
-            reply_markup=build_keyboard(day_key, slot, chat.id),
-        )
+    await send_test_reminder(context, chat.id, is_admin_test=True)
     await update.message.reply_text("✅ Тестовое напоминание отправлено!")
-    
-    REMINDER_MESSAGES.add_message(chat.id, day_key, slot, message.message_id)
-    
-    # Планируем повторное напоминание через 1 минуту (для тестов)
-    context.job_queue.run_once(
-        send_nag_reminder,
-        when=timedelta(minutes=1),
-        name=f"nag-{chat.id}-{day_key}-{slot}-1",
-        data={
-            "day_key": day_key,
-            "slot": slot,
-            "chat_id": chat.id,
-            "nag_count": 1,
-        },
-    )
 
 
 async def admin_test_nag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -972,6 +1076,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("calendar", calendar))
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("test", test_reminder))
+    app.add_handler(CommandHandler("reschedule", reschedule))
+    app.add_handler(CommandHandler("reshedule", reschedule))
     
     # Админские команды
     app.add_handler(CommandHandler("admin", admin_help))
@@ -984,20 +1090,17 @@ def build_application() -> Application:
     
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    for reminder_time in CONFIG.reminder_times:
-        slot = reminder_time.strftime("%H:%M")
-        app.job_queue.run_daily(
-            send_reminder,
-            time=reminder_time,
-            days=(0, 1, 2, 3, 4, 5, 6),
-            name=f"reminder-{slot}",
-            data={"slot": slot},
-        )
+    app.job_queue.run_repeating(
+        dispatch_reminders,
+        interval=timedelta(minutes=1),
+        first=2,
+        name="reminder-dispatcher",
+    )
     return app
 
 
 def main() -> None:
-    logger.info("Запуск бота. Времена напоминаний: %s", ", ".join(t.strftime("%H:%M") for t in CONFIG.reminder_times))
+    logger.info("Запуск бота. Базовые времена (по умолчанию): %s", ", ".join(t.strftime("%H:%M") for t in CONFIG.reminder_times))
     app = build_application()
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

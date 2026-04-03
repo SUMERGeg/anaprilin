@@ -195,6 +195,46 @@ class ReminderMessagesStorage:
             return self._photos.pop(key, None)
 
 
+class UserSettingsStorage:
+    """Хранилище пользовательских настроек (время напоминаний)."""
+
+    def __init__(self, file_path: Path) -> None:
+        self._file_path = file_path
+        self._file_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = Lock()
+        if not self._file_path.exists():
+            self._write({})
+
+    def _read(self) -> Dict[str, Dict[str, List[str]]]:
+        if not self._file_path.exists():
+            return {}
+        try:
+            return json.loads(self._file_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, ValueError):
+            return {}
+
+    def _write(self, data: Dict[str, Dict[str, List[str]]]) -> None:
+        tmp = self._file_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(self._file_path)
+
+    def get_times(self, chat_id: int) -> Optional[List[str]]:
+        with self._lock:
+            data = self._read()
+            row = data.get(str(chat_id), {})
+            times = row.get("reminder_times")
+            if not times:
+                return None
+            return list(times)
+
+    def set_times(self, chat_id: int, times: List[str]) -> None:
+        with self._lock:
+            data = self._read()
+            row = data.setdefault(str(chat_id), {})
+            row["reminder_times"] = list(times)
+            self._write(data)
+
+
 class SubscribersStorage:
     """Хранилище подписчиков бота."""
 
