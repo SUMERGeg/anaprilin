@@ -476,6 +476,7 @@ async def reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     slots = [t.strftime("%H:%M") for t in new_times]
     USER_SETTINGS.set_times(chat.id, slots)
+    cancel_all_followups_for_chat(context, chat.id)
     await send_with_retry(
         context.bot,
         chat.id,
@@ -816,6 +817,18 @@ def cancel_escalation_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         job.schedule_removal()
 
 
+def cancel_all_followups_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Отменяет все nag/escalation задачи для чата (после смены расписания)."""
+    job_queue = context.job_queue
+    if job_queue is None:
+        return
+    prefixes = (f"nag-{chat_id}-", f"esc-{chat_id}-")
+    for job in job_queue.jobs():
+        name = job.name or ""
+        if name.startswith(prefixes):
+            job.schedule_removal()
+
+
 async def send_escalation_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.job.data
     day_key = data["day_key"]
@@ -934,6 +947,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         slots = [values["morning"], values["afternoon"], values["evening"]]
         USER_SETTINGS.set_times(chat_id, slots)
+        cancel_all_followups_for_chat(context, chat_id)
         context.user_data.pop("reschedule_step", None)
         context.user_data.pop("reschedule_values", None)
         await send_with_retry(
