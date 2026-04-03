@@ -21,6 +21,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 from telegram.request import HTTPXRequest
 
@@ -116,6 +118,12 @@ def get_default_slots() -> List[str]:
 
 def get_user_slots(chat_id: int) -> List[str]:
     return USER_SETTINGS.get_times(chat_id) or get_default_slots()
+
+
+def build_back_to_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🏠 В главное меню", callback_data="menu_main")]]
+    )
 
 
 def is_admin(update: Update) -> bool:
@@ -284,14 +292,20 @@ async def send_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
         await send_with_retry(
             context.bot, chat_id,
             "Лизонька, ты ещё не подписана на напоминания! 😊\n"
-            "Напиши /start, чтобы я могла заботиться о тебе. 💕"
+            "Напиши /start, чтобы я могла заботиться о тебе. 💕",
+            reply_markup=build_back_to_menu_keyboard(),
         )
         return
 
     today_key = CONFIG.tz_aware_now.strftime("%Y-%m-%d")
     statuses = STORAGE.list_day(make_day_key(chat_id, today_key))
     if not statuses:
-        await send_with_retry(context.bot, chat_id, "Сегодня напоминаний ещё не было, солнышко! ☀️")
+        await send_with_retry(
+            context.bot,
+            chat_id,
+            "Сегодня напоминаний ещё не было, солнышко! ☀️",
+            reply_markup=build_back_to_menu_keyboard(),
+        )
         return
 
     lines = ["💊 Как дела с таблеточками сегодня, Лизочка:\n"]
@@ -303,7 +317,12 @@ async def send_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
             "skipped": "пропущено"
         }.get(item.status, item.status)
         lines.append(f"{emoji} {item.slot} — {status_text}")
-    await send_with_retry(context.bot, chat_id, "\n".join(lines))
+    await send_with_retry(
+        context.bot,
+        chat_id,
+        "\n".join(lines),
+        reply_markup=build_back_to_menu_keyboard(),
+    )
 
 
 def build_calendar_text_and_keyboard(chat_id: int, week_offset: int = 0) -> tuple[str, InlineKeyboardMarkup]:
@@ -359,7 +378,9 @@ def build_calendar_text_and_keyboard(chat_id: int, week_offset: int = 0) -> tupl
     # Отключаем кнопку "Следующая", если это текущая неделя
     if week_offset <= 0:
         keyboard[0][1] = InlineKeyboardButton("—", callback_data="cal_noop")
-    
+
+    keyboard.append([InlineKeyboardButton("🏠 В главное меню", callback_data="menu_main")])
+
     return "\n".join(lines), InlineKeyboardMarkup(keyboard)
 
 
@@ -375,7 +396,8 @@ async def send_calendar(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Non
         await send_with_retry(
             context.bot, chat_id,
             "Лизонька, ты ещё не подписана! 😊\n"
-            "Напиши /start, и я буду заботиться о тебе. 💕"
+            "Напиши /start, и я буду заботиться о тебе. 💕",
+            reply_markup=build_back_to_menu_keyboard(),
         )
         return
     text, keyboard = build_calendar_text_and_keyboard(chat_id, week_offset=0)
@@ -433,20 +455,16 @@ async def reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     if not SUBSCRIBERS.contains(chat.id):
-        await send_with_retry(context.bot, chat.id, "Сначала нажми /start, чтобы включить напоминания.")
-        return
-
-    if not context.args:
-        current = ", ".join(get_user_slots(chat.id))
         await send_with_retry(
             context.bot,
             chat.id,
-            "⏰ Текущее расписание: "
-            f"{current}\n\n"
-            "Чтобы изменить, отправь:\n"
-            "`/reschedule 09:00,15:00,21:00`",
-            parse_mode="Markdown",
+            "Сначала нажми /start, чтобы включить напоминания.",
+            reply_markup=build_back_to_menu_keyboard(),
         )
+        return
+
+    if not context.args:
+        await begin_reschedule_flow(context, chat.id)
         return
 
     raw = " ".join(context.args).replace(" ", "")
@@ -458,7 +476,129 @@ async def reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     slots = [t.strftime("%H:%M") for t in new_times]
     USER_SETTINGS.set_times(chat.id, slots)
-    await send_with_retry(context.bot, chat.id, "✅ Новое расписание сохранено: " + ", ".join(slots))
+    await send_with_retry(
+        context.bot,
+        chat.id,
+        "✅ Новое расписание сохранено: " + ", ".join(slots),
+        reply_markup=build_back_to_menu_keyboard(),
+    )
+
+
+async def begin_reschedule_flow(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    context.user_data["reschedule_step"] = "morning"
+    context.user_data["reschedule_values"] = {}
+    current = ", ".join(get_user_slots(chat_id))
+    await send_with_retry(
+        context.bot,
+        chat_id,
+        "⏰ Настройка расписания\n\n"
+        f"Текущее: {current}\n\n"
+        "Шаг 1/3: введи время *утреннего* приема в формате `HH:MM`",
+        parse_mode="Markdown",
+        reply_markup=build_back_to_menu_keyboard(),
+    )
+
+
+def validate_reschedule_values(values: dict[str, str]) -> str | None:
+    keys = ("morning", "afternoon", "evening")
+    if not all(k in values for k in keys):
+        return "Заполнены не все значения."
+    try:
+        parsed = [parse_times(values[k])[0] for k in keys]
+    except ValueError as exc:
+        return str(exc)
+
+    text_values = [v.strftime("%H:%M") for v in parsed]
+    if len(set(text_values)) != 3:
+        return "Время должно быть разным для всех трёх приёмов."
+    if not (parsed[0] < parsed[1] < parsed[2]):
+        return "Порядок должен быть: утро < день < вечер."
+    return None
+
+
+def build_reschedule_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Сохранить", callback_data="reschedule_save")],
+            [InlineKeyboardButton("✏️ Изменить заново", callback_data="reschedule_restart")],
+            [InlineKeyboardButton("🏠 В главное меню", callback_data="menu_main")],
+        ]
+    )
+
+
+async def handle_reschedule_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat = update.effective_chat
+    message = update.message
+    if chat is None or message is None:
+        return False
+
+    step = context.user_data.get("reschedule_step")
+    if step not in {"morning", "afternoon", "evening"}:
+        return False
+
+    raw = message.text.strip()
+    try:
+        parsed = parse_times(raw)
+        if len(parsed) != 1:
+            raise ValueError("Укажи только одно время в формате HH:MM")
+        value = parsed[0].strftime("%H:%M")
+    except ValueError as exc:
+        await send_with_retry(
+            context.bot,
+            chat.id,
+            f"⚠️ {exc}\nПопробуй еще раз.",
+            reply_markup=build_back_to_menu_keyboard(),
+        )
+        return True
+
+    values = context.user_data.setdefault("reschedule_values", {})
+    values[step] = value
+
+    if step == "morning":
+        context.user_data["reschedule_step"] = "afternoon"
+        await send_with_retry(
+            context.bot,
+            chat.id,
+            f"Утро: {value} ✅\n\nШаг 2/3: введи время *дневного* приема (`HH:MM`)",
+            parse_mode="Markdown",
+            reply_markup=build_back_to_menu_keyboard(),
+        )
+        return True
+
+    if step == "afternoon":
+        context.user_data["reschedule_step"] = "evening"
+        await send_with_retry(
+            context.bot,
+            chat.id,
+            f"День: {value} ✅\n\nШаг 3/3: введи время *вечернего* приема (`HH:MM`)",
+            parse_mode="Markdown",
+            reply_markup=build_back_to_menu_keyboard(),
+        )
+        return True
+
+    error = validate_reschedule_values(values)
+    if error:
+        await send_with_retry(
+            context.bot,
+            chat.id,
+            "⚠️ Проверка не прошла:\n"
+            f"{error}\n\n"
+            "Нажми «Изменить заново» или вернись в меню.",
+            reply_markup=build_reschedule_confirm_keyboard(),
+        )
+        return True
+
+    context.user_data["reschedule_step"] = "confirm"
+    await send_with_retry(
+        context.bot,
+        chat.id,
+        "Проверь новое расписание:\n"
+        f"🌅 Утро: {values['morning']}\n"
+        f"🌤 День: {values['afternoon']}\n"
+        f"🌙 Вечер: {values['evening']}",
+        reply_markup=build_reschedule_confirm_keyboard(),
+    )
+    return True
 
 
 def get_period_name(slot_time: str) -> str:
@@ -739,6 +879,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Ошибка получения чата.")
             return
         await query.answer()
+        if query.data == "menu_main":
+            await send_with_retry(
+                context.bot,
+                chat_id,
+                "🏠 Главное меню",
+                reply_markup=build_start_menu_keyboard(),
+            )
+            return
         if query.data == "menu_status":
             await send_status(context, chat_id)
         elif query.data == "menu_calendar":
@@ -751,21 +899,49 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await send_with_retry(
                     context.bot, chat_id,
                     "😢 Хорошо, Лизочка, я перестану напоминать...\n"
-                    "Если передумаешь, нажми /start 💕"
+                    "Если передумаешь, нажми /start 💕",
+                    reply_markup=build_back_to_menu_keyboard(),
                 )
             else:
-                await send_with_retry(context.bot, chat_id, "Ты уже не подписана на напоминания.")
+                await send_with_retry(
+                    context.bot,
+                    chat_id,
+                    "Ты уже не подписана на напоминания.",
+                    reply_markup=build_back_to_menu_keyboard(),
+                )
         elif query.data == "menu_reschedule_help":
-            current = ", ".join(get_user_slots(chat_id))
+            await begin_reschedule_flow(context, chat_id)
+        return
+
+    if query.data in {"reschedule_restart", "reschedule_save"}:
+        chat_id = query.message.chat_id if query.message else None
+        if chat_id is None:
+            await query.answer("Ошибка получения чата.")
+            return
+        await query.answer()
+        if query.data == "reschedule_restart":
+            await begin_reschedule_flow(context, chat_id)
+            return
+        values = context.user_data.get("reschedule_values", {})
+        error = validate_reschedule_values(values) if isinstance(values, dict) else "Данных нет."
+        if error:
             await send_with_retry(
                 context.bot,
                 chat_id,
-                "⏰ Текущее расписание: "
-                f"{current}\n\n"
-                "Измени его командой:\n"
-                "`/reschedule 09:00,15:00,21:00`",
-                parse_mode="Markdown",
+                f"⚠️ Нельзя сохранить: {error}",
+                reply_markup=build_reschedule_confirm_keyboard(),
             )
+            return
+        slots = [values["morning"], values["afternoon"], values["evening"]]
+        USER_SETTINGS.set_times(chat_id, slots)
+        context.user_data.pop("reschedule_step", None)
+        context.user_data.pop("reschedule_values", None)
+        await send_with_retry(
+            context.bot,
+            chat_id,
+            "✅ Расписание сохранено:\n" + ", ".join(slots),
+            reply_markup=build_back_to_menu_keyboard(),
+        )
         return
 
     # Обработка календаря
@@ -881,6 +1057,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         cancel_escalation_reminder(context, chat_id, day_key, slot)
     else:
         await query.edit_message_text("Что-то пошло не так... 🤔")
+
+
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    handled = await handle_reschedule_text(update, context)
+    if handled:
+        return
 
 
 # ==================== АДМИНСКИЕ КОМАНДЫ ====================
@@ -1089,6 +1271,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("aclear_day", admin_clear_day))
     
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
 
     app.job_queue.run_repeating(
         dispatch_reminders,
