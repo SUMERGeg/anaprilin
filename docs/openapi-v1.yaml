@@ -1,0 +1,80 @@
+openapi: 3.0.3
+info:
+  title: Anaprilin API
+  version: v1
+servers:
+  - url: /api/v1
+paths:
+  /healthz:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+  /me/schedule:
+    get:
+      summary: Get user schedule
+      responses:
+        "200":
+          description: OK
+    put:
+      summary: Update user schedule
+      responses:
+        "200":
+          description: Updated
+  /me/events:
+    get:
+      summary: List events in date range
+      parameters:
+        - in: query
+          name: from
+          schema:
+            type: string
+        - in: query
+          name: to
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+    post:
+      summary: Create or update intake event (idempotent)
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Accepted
+  /me/push/subscribe:
+    post:
+      summary: Save push subscription
+      responses:
+        "200":
+          description: Saved
+  /me/push/subscribe/{id}:
+    delete:
+      summary: Disable/remove push subscription
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Removed
+  /sync/pull:
+    post:
+      summary: Pull server changes from cursor/revision
+      responses:
+        "200":
+          description: OK
+  /sync/push:
+    post:
+      summary: Push offline operations outbox
+      responses:
+        "200":
+          description: Accepted
+

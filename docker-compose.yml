@@ -1,0 +1,11 @@
+services:
+  api:
+    build:
+      context: ./backend
+    container_name: anaprilin_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      TZ: Europe/Moscow
+
