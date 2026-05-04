@@ -1,13 +1,14 @@
 {
   "name": "Anaprilin Reminder",
   "short_name": "Anaprilin",
-  "id": "/",
+  "id": "/?app=anaprilin-pwa",
   "start_url": "/?source=pwa",
   "scope": "/",
   "display": "standalone",
   "orientation": "portrait",
   "background_color": "#ffffff",
   "theme_color": "#0b6bcb",
+  "prefer_related_applications": false,
   "icons": [
     {
       "src": "/icons/icon-192.png",
@@ -23,7 +24,7 @@
       "src": "/icons/icon-512.png",
       "sizes": "512x512",
       "type": "image/png",
-      "purpose": "maskable"
+      "purpose": "any maskable"
     }
   ]
 }

@@ -2,7 +2,7 @@
 
 import { clientsClaim, setCacheNameDetails } from "workbox-core";
 import { ExpirationPlugin } from "workbox-expiration";
-import { addRoute, cleanupOutdatedCaches, createHandlerBoundToURL, precache } from "workbox-precaching";
+import { cleanupOutdatedCaches, createHandlerBoundToURL, precacheAndRoute } from "workbox-precaching";
 import { registerRoute, NavigationRoute } from "workbox-routing";
 import { CacheFirst, NetworkOnly } from "workbox-strategies";
 
@@ -10,65 +10,103 @@ declare let self: ServiceWorkerGlobalScope & {
   __WB_MANIFEST: Array<unknown>;
 };
 
-const CURRENT_CACHE_PREFIX = "anaprilin-pwa-v3";
+const CURRENT_CACHE_PREFIX = "anaprilin-pwa-v4";
 const MEDIA_CACHE = `${CURRENT_CACHE_PREFIX}-media`;
 const LEGACY_RUNTIME_CACHES = new Set(["assets-cache", "api-get-cache", "media-cache", "html-cache"]);
-const LEGACY_CACHE_PREFIXES = ["workbox-", "anaprilin-pwa-v1", "anaprilin-pwa-v2"];
+const LEGACY_CACHE_PREFIXES = ["workbox-", "anaprilin-pwa-v1", "anaprilin-pwa-v2", "anaprilin-pwa-v3"];
 
 setCacheNameDetails({ prefix: CURRENT_CACHE_PREFIX });
 
 self.skipWaiting();
 clientsClaim();
 
-precache(self.__WB_MANIFEST);
+precacheAndRoute(self.__WB_MANIFEST, {
+  ignoreURLParametersMatching: [/^utm_/, /^fbclid$/, /^source$/, /^screen$/, /^day$/, /^slot$/, /^after_reset$/, /^v$/]
+});
 cleanupOutdatedCaches();
 
-self.addEventListener("activate", (event) => {
-  event.waitUntil(
-    (async () => {
-      const cacheNames = await caches.keys();
-      await Promise.all(
-        cacheNames.map((cacheName) => {
-          const isCurrentCache = cacheName.startsWith(`${CURRENT_CACHE_PREFIX}-`);
-          const isLegacyCache =
-            LEGACY_RUNTIME_CACHES.has(cacheName) || LEGACY_CACHE_PREFIXES.some((prefix) => cacheName.startsWith(prefix));
+async function deleteLegacyCaches(): Promise<void> {
+  const cacheNames = await caches.keys();
+  await Promise.all(
+    cacheNames.map((cacheName) => {
+      const isCurrentCache = cacheName.startsWith(`${CURRENT_CACHE_PREFIX}-`);
+      const isLegacyCache =
+        LEGACY_RUNTIME_CACHES.has(cacheName) || LEGACY_CACHE_PREFIXES.some((prefix) => cacheName.startsWith(prefix));
 
-          return !isCurrentCache && isLegacyCache ? caches.delete(cacheName) : Promise.resolve(false);
-        })
-      );
-    })()
+      return !isCurrentCache && isLegacyCache ? caches.delete(cacheName) : Promise.resolve(false);
+    })
   );
+}
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(deleteLegacyCaches());
+});
+
+self.addEventListener("message", (event) => {
+  if (event.data?.type === "SKIP_WAITING") {
+    self.skipWaiting();
+  }
+
+  if (event.data?.type === "CLEAR_LEGACY_CACHES") {
+    event.waitUntil(deleteLegacyCaches());
+  }
 });
 
 const appShellFallback = createHandlerBoundToURL("/index.html");
+
 const navigationHandler = async (options: Parameters<typeof appShellFallback>[0]): Promise<Response> => {
   try {
-    const networkResponse = await fetch(new Request(options.request, { cache: "no-store" }));
-    if (networkResponse.ok) {
+    const networkResponse = await fetch(options.request, {
+      cache: "no-store",
+      credentials: "same-origin",
+      redirect: "follow",
+      headers: {
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache"
+      }
+    });
+
+    const contentType = networkResponse.headers.get("content-type") ?? "";
+    if (networkResponse.ok && contentType.includes("text/html")) {
       return networkResponse;
     }
   } catch {
-    // Fall through to the precached app shell for offline starts.
+    // Offline start: fall back to the precached app shell.
   }
 
   return appShellFallback(options);
 };
 
-registerRoute(new NavigationRoute(navigationHandler, { denylist: [/^\/api\//, /\/[^/?]+\.[^/]+$/] }));
-
-addRoute();
+registerRoute(
+  new NavigationRoute(navigationHandler, {
+    denylist: [/^\/api(?:\/|$)/, /^\/sw\.js$/, /^\/manifest\.webmanifest$/, /\/[^/?]+\.[^/]+$/]
+  })
+);
 
 registerRoute(
-  ({ request }) => request.destination === "image" || request.destination === "font",
+  ({ url }) => url.origin === self.location.origin && url.pathname.startsWith("/api/"),
+  new NetworkOnly(),
+  "GET"
+);
+
+for (const method of ["POST", "PUT", "PATCH", "DELETE"] as const) {
+  registerRoute(
+    ({ url }) => url.origin === self.location.origin && url.pathname.startsWith("/api/"),
+    new NetworkOnly(),
+    method
+  );
+}
+
+registerRoute(
+  ({ request, url }) =>
+    request.method === "GET" &&
+    url.origin === self.location.origin &&
+    (request.destination === "image" || request.destination === "font"),
   new CacheFirst({
     cacheName: MEDIA_CACHE,
     plugins: [new ExpirationPlugin({ maxEntries: 100, maxAgeSeconds: 60 * 60 * 24 * 30 })]
   })
 );
-
-for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE"] as const) {
-  registerRoute(({ url }) => url.pathname.startsWith("/api/"), new NetworkOnly(), method);
-}
 
 interface PushDataPayload {
   title?: string;
