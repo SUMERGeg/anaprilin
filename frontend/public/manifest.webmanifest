@@ -3,7 +3,7 @@
   "short_name": "Anaprilin",
   "start_url": "/",
   "scope": "/",
-  "display": "standalone",
+  "display": "browser",
   "background_color": "#ffffff",
   "theme_color": "#0b6bcb",
   "icons": [
