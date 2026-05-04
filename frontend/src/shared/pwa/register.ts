@@ -1,13 +1,17 @@
-import { registerSW } from "virtual:pwa-register";
+export async function clearLegacyServiceWorkers(): Promise<void> {
+  if (!("serviceWorker" in navigator)) {
+    return;
+  }
 
-export function registerServiceWorker(): void {
-  registerSW({
-    immediate: false,
-    onOfflineReady() {
-      console.info("PWA ready for offline usage.");
-    },
-    onRegisterError(error) {
-      console.error("SW register failed:", error);
+  try {
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(registrations.map((registration) => registration.unregister()));
+
+    if ("caches" in window) {
+      const cacheNames = await caches.keys();
+      await Promise.all(cacheNames.map((cacheName) => caches.delete(cacheName)));
     }
-  });
+  } catch (error) {
+    console.warn("Legacy SW cleanup failed:", error);
+  }
 }
