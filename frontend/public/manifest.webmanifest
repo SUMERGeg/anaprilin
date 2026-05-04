@@ -1,9 +1,11 @@
 {
   "name": "Anaprilin Reminder",
   "short_name": "Anaprilin",
-  "start_url": "/",
+  "id": "/",
+  "start_url": "/?source=pwa",
   "scope": "/",
-  "display": "browser",
+  "display": "standalone",
+  "orientation": "portrait",
   "background_color": "#ffffff",
   "theme_color": "#0b6bcb",
   "icons": [

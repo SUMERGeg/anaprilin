@@ -1,46 +1,74 @@
 /// <reference lib="webworker" />
 
-import { clientsClaim } from "workbox-core";
+import { clientsClaim, setCacheNameDetails } from "workbox-core";
 import { ExpirationPlugin } from "workbox-expiration";
-import { precacheAndRoute, cleanupOutdatedCaches, createHandlerBoundToURL } from "workbox-precaching";
+import { addRoute, cleanupOutdatedCaches, createHandlerBoundToURL, precache } from "workbox-precaching";
 import { registerRoute, NavigationRoute } from "workbox-routing";
-import { CacheFirst, NetworkFirst, StaleWhileRevalidate } from "workbox-strategies";
+import { CacheFirst, NetworkOnly } from "workbox-strategies";
 
 declare let self: ServiceWorkerGlobalScope & {
   __WB_MANIFEST: Array<unknown>;
 };
 
+const CURRENT_CACHE_PREFIX = "anaprilin-pwa-v3";
+const MEDIA_CACHE = `${CURRENT_CACHE_PREFIX}-media`;
+const LEGACY_RUNTIME_CACHES = new Set(["assets-cache", "api-get-cache", "media-cache", "html-cache"]);
+const LEGACY_CACHE_PREFIXES = ["workbox-", "anaprilin-pwa-v1", "anaprilin-pwa-v2"];
+
+setCacheNameDetails({ prefix: CURRENT_CACHE_PREFIX });
+
 self.skipWaiting();
 clientsClaim();
 
-precacheAndRoute(self.__WB_MANIFEST);
+precache(self.__WB_MANIFEST);
 cleanupOutdatedCaches();
 
-const navigationHandler = createHandlerBoundToURL("/index.html");
-registerRoute(new NavigationRoute(navigationHandler));
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    (async () => {
+      const cacheNames = await caches.keys();
+      await Promise.all(
+        cacheNames.map((cacheName) => {
+          const isCurrentCache = cacheName.startsWith(`${CURRENT_CACHE_PREFIX}-`);
+          const isLegacyCache =
+            LEGACY_RUNTIME_CACHES.has(cacheName) || LEGACY_CACHE_PREFIXES.some((prefix) => cacheName.startsWith(prefix));
 
-registerRoute(
-  ({ request }) => request.destination === "style" || request.destination === "script",
-  new StaleWhileRevalidate({
-    cacheName: "assets-cache"
-  })
-);
+          return !isCurrentCache && isLegacyCache ? caches.delete(cacheName) : Promise.resolve(false);
+        })
+      );
+    })()
+  );
+});
+
+const appShellFallback = createHandlerBoundToURL("/index.html");
+const navigationHandler = async (options: Parameters<typeof appShellFallback>[0]): Promise<Response> => {
+  try {
+    const networkResponse = await fetch(new Request(options.request, { cache: "no-store" }));
+    if (networkResponse.ok) {
+      return networkResponse;
+    }
+  } catch {
+    // Fall through to the precached app shell for offline starts.
+  }
+
+  return appShellFallback(options);
+};
+
+registerRoute(new NavigationRoute(navigationHandler, { denylist: [/^\/api\//, /\/[^/?]+\.[^/]+$/] }));
+
+addRoute();
 
 registerRoute(
   ({ request }) => request.destination === "image" || request.destination === "font",
   new CacheFirst({
-    cacheName: "media-cache",
+    cacheName: MEDIA_CACHE,
     plugins: [new ExpirationPlugin({ maxEntries: 100, maxAgeSeconds: 60 * 60 * 24 * 30 })]
   })
 );
 
-registerRoute(
-  ({ request, url }) => request.method === "GET" && url.pathname.startsWith("/api/"),
-  new NetworkFirst({
-    cacheName: "api-get-cache",
-    networkTimeoutSeconds: 3
-  })
-);
+for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE"] as const) {
+  registerRoute(({ url }) => url.pathname.startsWith("/api/"), new NetworkOnly(), method);
+}
 
 interface PushDataPayload {
   title?: string;
@@ -94,4 +122,3 @@ self.addEventListener("notificationclick", (event) => {
     })
   );
 });
-
